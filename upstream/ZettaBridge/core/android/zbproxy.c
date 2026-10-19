@@ -38,6 +38,20 @@ static const char kActivityMethodSignature[] = "(JJJLjava/lang/String;)Z";
 // supplies the VM and current-thread JNIEnv. The path is copied: dladdr owns its string.
 static JavaVM* g_vm;
 static char g_proxy_path[1024];
+// The bridge class as the first successful lookup found it (normally JNI_OnLoad, under ART's
+// plugin class-loader override), for ANativeActivity_onCreate: the framework calls that from its
+// own native code, where FindClass resolves against the boot class loader and cannot see the
+// launcher's classes. Minecraft PE loads its library from a static initializer and only then
+// enters through NativeActivity, so it takes exactly that path.
+static jclass g_bridge;
+
+// ANativeActivity starts with callbacks, JavaVM, JNIEnv and the Java activity object.
+struct ActivityPrefix {
+    void* callbacks;
+    JavaVM* vm;
+    JNIEnv* env;
+    jobject clazz;
+};
 
 __attribute__((format(printf, 1, 2)))
 static void log_error(const char* format, ...) {
@@ -105,6 +119,7 @@ static jint notify_proxy_loaded(JNIEnv* env, const char* path, jobject activity)
         log_error("%s: class %s not found", path, kBridgeClass);
         return JNI_ERR;
     }
+    if (g_bridge == NULL) g_bridge = (jclass)(*env)->NewGlobalRef(env, bridge);
 
     jint result = JNI_ERR;
     jstring jpath = NULL;
@@ -169,22 +184,18 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 // keeps the proxy free of NDK headers so the host unit test can load it.
 JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_state, size_t saved_state_size) {
     JNIEnv* env = NULL;
-    jobject activity_object = NULL;
+    struct ActivityPrefix* native = (struct ActivityPrefix*)activity;
+    // The activity's own class loader is the plugin loader, which reaches the bridge; FindClass
+    // from here would use the boot class loader.
+    jobject activity_object = native != NULL ? native->clazz : NULL;
     if (g_vm != NULL && g_proxy_path[0] != 0) {
         if ((*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK || env == NULL) {
             log_error("%s: GetEnv(JNI_VERSION_1_6) failed in ANativeActivity_onCreate", g_proxy_path);
             return;
         }
     } else {
-        // ANativeActivity starts with callbacks, JavaVM and JNIEnv. Android can call this entry
-        // point without calling JNI_OnLoad, so bootstrap the same proxy load from those fields.
-        struct ActivityPrefix {
-            void* callbacks;
-            JavaVM* vm;
-            JNIEnv* env;
-            jobject clazz;
-        };
-        struct ActivityPrefix* native = (struct ActivityPrefix*)activity;
+        // Android can call this entry point without calling JNI_OnLoad, so bootstrap the same
+        // proxy load from the activity's fields.
         if (native == NULL || native->vm == NULL || native->env == NULL ||
             !proxy_path(g_proxy_path, sizeof g_proxy_path)) {
             log_error("ANativeActivity_onCreate has no VM, JNIEnv or proxy path");
@@ -192,7 +203,6 @@ JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_stat
         }
         g_vm = native->vm;
         env = native->env;
-        activity_object = native->clazz;
         if ((*env)->ExceptionCheck(env)) {
             log_error("%s: exception already pending in ANativeActivity_onCreate", g_proxy_path);
             return;
@@ -208,9 +218,12 @@ JNIEXPORT void JNICALL ANativeActivity_onCreate(void* activity, void* saved_stat
         return;
     }
 
-    jclass bridge = find_bridge(env, activity_object);
+    jclass bridge = g_bridge != NULL ? (jclass)(*env)->NewLocalRef(env, g_bridge) : find_bridge(env, activity_object);
     if (bridge == NULL) {
         log_error("%s: class %s not found", g_proxy_path, kBridgeClass);
+        // Cleared for the same reason as below: a pending NoClassDefFoundError here kills the
+        // process on the framework's next JNI call, with no trace of where it came from.
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         return;
     }
     jstring path = NULL;

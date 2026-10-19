@@ -81,6 +81,40 @@ void NativeActivityGlue::attach(std::uint64_t activity, std::uint32_t guest_acti
     log("NativeActivity callbacks installed for guest activity 0x%08x", guest_activity);
 }
 
+bool NativeActivityGlue::request(std::uint32_t guest_activity, Request request, std::uint32_t first,
+                                 std::uint32_t second) {
+    ANativeActivity* native = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const auto& [host, attachment] : g_attachments) {
+            if (attachment.guest_activity != guest_activity) continue;
+            native = const_cast<ANativeActivity*>(host);
+            break;
+        }
+    }
+    if (native == nullptr) return false;
+    // The framework's helpers only post a command to the activity's main thread, so they are safe
+    // from the guest thread that calls them, and none of them calls back into the guest.
+    switch (request) {
+    case Request::Finish:
+        ANativeActivity_finish(native);
+        break;
+    case Request::HideSoftInput:
+        ANativeActivity_hideSoftInput(native, first);
+        break;
+    case Request::SetWindowFlags:
+        ANativeActivity_setWindowFlags(native, first, second);
+        break;
+    case Request::SetWindowFormat:
+        ANativeActivity_setWindowFormat(native, static_cast<std::int32_t>(first));
+        break;
+    case Request::ShowSoftInput:
+        ANativeActivity_showSoftInput(native, first);
+        break;
+    }
+    return true;
+}
+
 void NativeActivityGlue::on_start(ANativeActivity* activity) { deliver(activity, GuestCallback::OnStart, 0); }
 void NativeActivityGlue::on_resume(ANativeActivity* activity) { deliver(activity, GuestCallback::OnResume, 0); }
 void NativeActivityGlue::on_pause(ANativeActivity* activity) { deliver(activity, GuestCallback::OnPause, 0); }

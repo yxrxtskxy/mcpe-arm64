@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 
 #include <dynarmic/interface/exclusive_monitor.h>
@@ -14,6 +15,7 @@
 #include "zb/cp15.h"
 #include <cstdio>
 
+#include "zb/hang_watchdog.h"
 #include "zb/log.h"
 #include "zb/runtime_report.h"
 
@@ -23,6 +25,7 @@ namespace {
 
 constexpr Dynarmic::HaltReason kStopHalt = Dynarmic::HaltReason::UserDefined1;
 constexpr Dynarmic::HaltReason kInterruptHalt = Dynarmic::HaltReason::UserDefined2;
+constexpr Dynarmic::HaltReason kProfileHalt = Dynarmic::HaltReason::UserDefined3;
 // With check_halt_on_memory_access, code emitted after each memory access tests this bit and
 // returns with PC set to the accessing instruction, so faults are precise.
 constexpr Dynarmic::HaltReason kMemoryAbortHalt = Dynarmic::HaltReason::MemoryAbort;
@@ -43,6 +46,40 @@ void store(std::uint8_t* p, T v) {
     std::memcpy(p, &v, sizeof v);
 }
 
+// STREX: the monitor lock orders exclusive stores against each other only. A plain store from
+// another thread (the release of a spinlock, say) can land between a separate compare and write,
+// and the write then overwrites it: a byte lock taken that way stays set with no owner and every
+// thread spins on it forever. The compare and the write are one atomic exchange on guest memory.
+// ARM faults an unaligned exclusive access before it gets here; such an address keeps the plain
+// compare-and-write.
+template <typename T>
+bool compare_exchange(std::uint8_t* p, T value, T expected) {
+    if (reinterpret_cast<std::uintptr_t>(p) % sizeof(T) != 0) {
+        if (load<T>(p) != expected) return false;
+        store(p, value);
+        return true;
+    }
+    return __atomic_compare_exchange_n(reinterpret_cast<T*>(p), &expected, value, false, __ATOMIC_SEQ_CST,
+                                       __ATOMIC_SEQ_CST);
+}
+
+// Translated code runs with the guest's floating-point modes in FPCR (rounding, flush to zero).
+std::uint64_t read_fpcr() {
+#if defined(__aarch64__)
+    std::uint64_t value;
+    asm volatile("mrs %0, fpcr" : "=r"(value));
+    return value;
+#else
+    return 0;
+#endif
+}
+
+void write_fpcr([[maybe_unused]] std::uint64_t value) {
+#if defined(__aarch64__)
+    asm volatile("msr fpcr, %0" : : "r"(value));
+#endif
+}
+
 }  // namespace
 
 GuestThread::GuestThread(GuestMemory& mem, Dynarmic::ExclusiveMonitor* monitor, std::size_t processor_id,
@@ -57,6 +94,15 @@ GuestThread::GuestThread(GuestMemory& mem, Dynarmic::ExclusiveMonitor* monitor, 
     cfg.arch_version = Dynarmic::A32::ArchVersion::v8;
     cfg.fastmem_pointer = static_cast<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(mem.base()));
     cfg.coprocessors[15] = cp15_;
+    // An empty slot makes Dynarmic assert at JIT time on any access to that coprocessor, which
+    // kills the whole process; these log the access once and treat it as a no-op instead.
+    // Stateless, so one set serves every thread.
+    static const auto absent = [] {
+        std::array<std::shared_ptr<Dynarmic::A32::Coprocessor>, 15> slots;
+        for (unsigned i = 0; i < slots.size(); ++i) slots[i] = std::make_shared<AbsentCoprocessor>(i);
+        return slots;
+    }();
+    for (unsigned i = 0; i < absent.size(); ++i) cfg.coprocessors[i] = absent[i];
     cfg.define_unpredictable_behaviour = true;
     cfg.enable_cycle_counting = false;
     cfg.check_halt_on_memory_access = precise_faults;
@@ -110,6 +156,7 @@ Stop GuestThread::translator_gave_up(const char* reason) {
 
 Stop GuestThread::run() {
     pending_ = Stop{};
+    host_fpcr_ = read_fpcr();
     for (;;) {
         Dynarmic::HaltReason reason{};
         try {
@@ -120,6 +167,11 @@ Stop GuestThread::run() {
             return translator_gave_up(nullptr);
         }
         jit_->ClearHalt(kStopHalt | kMemoryAbortHalt);
+        if (Dynarmic::Has(reason, kProfileHalt)) {
+            jit_->ClearHalt(kProfileHalt);
+            record_profile_sample(jit_->Regs()[15]);
+            if (pending_.kind == StopKind::None && reason == kProfileHalt) continue;
+        }
         if (pending_.kind == StopKind::None && Dynarmic::Has(reason, kInterruptHalt)) {
             jit_->ClearHalt(kInterruptHalt);
             pending_.kind = StopKind::Interrupted;
@@ -137,6 +189,12 @@ Stop GuestThread::run() {
 
 std::optional<GuestResult> GuestThread::call(std::uint32_t target, const GuestCall& args,
                                              const GuestStopHandler& handle_stop) {
+    if (inline_depth_ != 0) {
+        // Dynarmic is running further up this stack and cannot be entered again; the host call
+        // that got here must be left out of InlineHostCalls.
+        log("guest code called from a host call served inside translated code (pc 0x%08x)", regs()[15]);
+        std::abort();
+    }
     const auto saved_regs = regs();
     const auto saved_ext = ext_regs();
     const std::uint32_t saved_cpsr = cpsr();
@@ -204,6 +262,10 @@ void GuestThread::interrupt() {
     // flag before it checks for pending signals, so at least one of the two sees the other.
     if (blocking_.load() == 0 || tid == 0) return;
     ::syscall(SYS_tgkill, ::getpid(), tid, host_interrupt_signal());
+}
+
+void GuestThread::request_profile_sample() {
+    jit_->HaltExecution(kProfileHalt);
 }
 
 void GuestThread::post_signal(const g::siginfo32& info) {
@@ -285,29 +347,22 @@ void GuestThread::MemoryWrite64(std::uint32_t vaddr, std::uint64_t value) {
     if (check_access(vaddr, 8, kPageWrite, true)) store(mem_.base() + vaddr, value);
 }
 
-// The ExclusiveMonitor serializes these calls; compare-then-write is atomic under its lock.
+// The ExclusiveMonitor serializes these calls against each other; compare_exchange keeps them
+// atomic against plain stores too.
 bool GuestThread::MemoryWriteExclusive8(std::uint32_t vaddr, std::uint8_t value, std::uint8_t expected) {
-    if (!check_access(vaddr, 1, kPageRead | kPageWrite, true) || mem_.base()[vaddr] != expected) return false;
-    mem_.base()[vaddr] = value;
-    return true;
+    return check_access(vaddr, 1, kPageRead | kPageWrite, true) && compare_exchange(mem_.base() + vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive16(std::uint32_t vaddr, std::uint16_t value, std::uint16_t expected) {
-    if (!check_access(vaddr, 2, kPageRead | kPageWrite, true) || load<std::uint16_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    return check_access(vaddr, 2, kPageRead | kPageWrite, true) && compare_exchange(mem_.base() + vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive32(std::uint32_t vaddr, std::uint32_t value, std::uint32_t expected) {
-    if (!check_access(vaddr, 4, kPageRead | kPageWrite, true) || load<std::uint32_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    return check_access(vaddr, 4, kPageRead | kPageWrite, true) && compare_exchange(mem_.base() + vaddr, value, expected);
 }
 
 bool GuestThread::MemoryWriteExclusive64(std::uint32_t vaddr, std::uint64_t value, std::uint64_t expected) {
-    if (!check_access(vaddr, 8, kPageRead | kPageWrite, true) || load<std::uint64_t>(mem_.base() + vaddr) != expected) return false;
-    store(mem_.base() + vaddr, value);
-    return true;
+    return check_access(vaddr, 8, kPageRead | kPageWrite, true) && compare_exchange(mem_.base() + vaddr, value, expected);
 }
 
 std::optional<std::uint32_t> GuestThread::MemoryReadCode(std::uint32_t vaddr) {
@@ -325,7 +380,25 @@ void GuestThread::InterpreterFallback(std::uint32_t pc, std::size_t num_instruct
     halt();
 }
 
+// Leaving translated code costs more than most GL calls themselves: Dynarmic saves and restores
+// the host state and forgets its predicted returns, so the returns that follow the call go
+// through its dispatcher too. A call InlineHostCalls takes is served here instead, and translated
+// code carries on at the next instruction. The host code gets the host's FPCR back meanwhile.
+bool GuestThread::serve_inline(std::uint32_t swi) {
+    const std::uint64_t guest_fpcr = read_fpcr();
+    if (guest_fpcr != host_fpcr_) write_fpcr(host_fpcr_);
+    ++inline_depth_;
+    const bool served = inline_calls_->serve(swi, *this);
+    --inline_depth_;
+    if (guest_fpcr != host_fpcr_) write_fpcr(guest_fpcr);
+    return served;
+}
+
 void GuestThread::CallSVC(std::uint32_t swi) {
+    if (pending_.kind == StopKind::None && inline_calls_ != nullptr && inline_calls_->accepts(swi) &&
+        serve_inline(swi)) {
+        return;
+    }
     if (pending_.kind == StopKind::None) {
         pending_.kind = StopKind::Svc;
         pending_.swi = swi;

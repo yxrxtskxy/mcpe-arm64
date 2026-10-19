@@ -131,6 +131,10 @@ public:
     GLint pixel_alignment(bool pack) const;
     std::optional<std::uint64_t> uniform_elements(GLuint program, GLint location);
     std::optional<std::uint32_t> allocate_guest(std::size_t size);
+    // The calls that allocate or free guest memory (the strings of glGetString*, the mirrors of
+    // mapped buffers). Without a test GuestAllocator that runs the guest's malloc and free, so
+    // these are never served inside translated code (Process::set_inline_host_calls).
+    static bool reenters_guest(std::uint32_t index);
     // Releases an allocate_guest() block. A HostGl built with a test GuestAllocator has no
     // matching deallocator, so the block is simply left to that allocator's arena.
     void free_guest(std::uint32_t address);

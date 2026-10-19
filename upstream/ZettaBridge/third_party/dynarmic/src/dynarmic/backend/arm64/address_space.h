@@ -69,6 +69,24 @@ protected:
 
     FakeCall FastmemCallback(u64 host_pc);
 
+    // OptimizationFlag::FastDispatch: a direct-mapped cache in front of block_entries, which the
+    // A32 dispatcher probes in a few instructions before it calls GetOrEmit. An entry holds the
+    // complement of its location descriptor, so the zero pages of a fresh table are all empty
+    // and only the pages entries are written to are ever committed.
+    struct FastDispatchEntry {
+        u64 inverted_descriptor;
+        CodePtr code_ptr;
+    };
+    static_assert(sizeof(FastDispatchEntry) == 16);
+    static constexpr size_t fast_dispatch_table_size = size_t{1} << 16;
+    static constexpr u64 FastDispatchIndex(u64 descriptor) {
+        return ((descriptor >> 1) ^ (descriptor >> 17) ^ (descriptor >> 32)) & (fast_dispatch_table_size - 1);
+    }
+    void AllocateFastDispatchTable();
+    void ClearFastDispatchTable();
+    void SetFastDispatchEntry(IR::LocationDescriptor descriptor, CodePtr code_ptr);
+    FastDispatchEntry* fast_dispatch_table = nullptr;  // null without the optimization
+
     const size_t code_cache_size;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;

@@ -24,6 +24,10 @@ enum class ThreadActivityKind : std::uint8_t {
 // call (`id` = host-call index). Lock-free, allocation-free, safe from any thread: called on
 // every syscall and every host call, so it must stay cheap.
 void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id);
+// The same, also remembering the guest's return address and stack pointer at that moment, so a
+// thread found waiting can be placed in guest code (HangWatchdog's thread dump).
+void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id, std::uint32_t guest_lr,
+                            std::uint32_t guest_sp);
 
 // The host call recorded last for this thread has returned. A thread whose last recorded event is
 // still in progress is blocked inside our own code, which reads very differently from a guest
@@ -36,7 +40,15 @@ struct ThreadActivitySample {
     std::uint32_t id = 0;
     std::uint64_t counter = 0;
     bool in_progress = false;  // still inside the recorded host call or syscall
+    std::uint32_t guest_lr = 0;  // at the recorded call, when the caller passed it
+    std::uint32_t guest_sp = 0;
 };
+
+// Sampling profiler, on when the system property debug.zb.profile is "1" (or ZB_PROFILE is set):
+// guest threads record the guest pc at which a sample request stopped them, and the sampler logs
+// the hottest translated blocks every few seconds.
+void record_profile_sample(std::uint32_t guest_pc);
+bool profiling_enabled();
 
 // A snapshot of every guest thread slot touched so far.
 std::vector<ThreadActivitySample> snapshot_thread_activity();

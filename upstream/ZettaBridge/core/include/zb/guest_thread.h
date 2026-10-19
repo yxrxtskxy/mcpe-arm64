@@ -32,7 +32,11 @@ inline constexpr std::uint32_t kHostReturnAddress = 0xFFFF0F00;
 int host_interrupt_signal();
 
 // Translated-code cache of one JIT. Carrier JITs only run thread start-up and parking.
-inline constexpr std::size_t kDefaultCodeCacheSize = 32 * 1024 * 1024;
+// Dynarmic's arm64 backend flushes a full code cache entirely and starts translating again, so a
+// guest whose hot code does not fit spends its time re-translating. Minecraft PE's working set
+// does not fit 32 MiB; the backend's ceiling is 128 MiB. Address space only: pages are committed
+// as translations are written.
+inline constexpr std::size_t kDefaultCodeCacheSize = 120 * 1024 * 1024;
 inline constexpr std::size_t kCarrierCodeCacheSize = 2 * 1024 * 1024;
 
 struct GuestResult {
@@ -54,8 +58,25 @@ struct Stop {
 
 using GuestStopHandler = std::function<bool(const Stop&)>;
 
-// One guest CPU context on one host thread. Dynarmic callbacks never do host work: they
-// record a Stop and halt the JIT; the caller of run() handles it and calls run() again.
+class GuestThread;
+
+// Host calls a GuestThread serves inside translated code, from CallSVC, instead of stopping.
+// Only calls that never run guest code qualify: Dynarmic cannot be entered again while it runs.
+class InlineHostCalls {
+public:
+    // Asked on every svc, so it must be cheap.
+    virtual bool accepts(std::uint32_t swi) const = 0;
+    // Serves the call. False when the thread must stop after all; it then sets
+    // GuestThread::host_call_served so that the stop does not serve the call a second time.
+    virtual bool serve(std::uint32_t swi, GuestThread& thread) = 0;
+
+protected:
+    ~InlineHostCalls() = default;
+};
+
+// One guest CPU context on one host thread. Dynarmic callbacks record a Stop and halt the JIT;
+// the caller of run() handles it and calls run() again. The one exception is the host calls
+// set_inline_host_calls() admits, which CallSVC serves in place.
 class GuestThread final : public Dynarmic::A32::UserCallbacks {
 public:
     // precise_faults: a memory fault stops at the faulting instruction with all guest registers
@@ -85,10 +106,17 @@ public:
                                     const GuestStopHandler& handle_stop);
     // Drop translated code for [addr, addr + len). Safe to call from other host threads.
     void invalidate(std::uint32_t addr, std::uint32_t len);
+    // See InlineHostCalls. Set before the thread first runs; null stops for every svc.
+    void set_inline_host_calls(InlineHostCalls* calls) { inline_calls_ = calls; }
+    // True inside a host call served from CallSVC, i.e. with Dynarmic running.
+    bool serving_inline() const { return inline_depth_ != 0; }
 
     // Queues a signal for this thread, interrupts its JIT, wakes park() and interrupts a host
     // syscall this thread blocks in. Async-signal-safe.
     void post_signal(const g::siginfo32& info);
+    // Sampling profiler (debug.zb.profile): stops the JIT at the next block boundary, where run()
+    // records the guest pc and carries on. Safe from any thread.
+    void request_profile_sample();
     // Takes the lowest-numbered pending signal not in `blocked`; false if there is none.
     bool take_signal(std::uint64_t blocked, g::siginfo32& out);
     bool has_pending_signals(std::uint64_t blocked) const { return (pending_signals_.load() & ~blocked) != 0; }
@@ -133,6 +161,8 @@ public:
     int call_depth = 0;
     // Code cache size for threads this thread clones; 0 selects kDefaultCodeCacheSize.
     std::size_t child_code_cache_size = 0;
+    // See InlineHostCalls::serve.
+    bool host_call_served = false;
     // Host tid of the host thread running this guest thread.
     std::int32_t tid = 0;
 
@@ -158,6 +188,13 @@ public:
 private:
     bool check_access(std::uint32_t vaddr, std::uint32_t len, std::uint8_t need, bool write);
     void halt();
+    bool serve_inline(std::uint32_t swi);
+
+    InlineHostCalls* inline_calls_ = nullptr;
+    // Inline host calls in progress; call() must not enter Dynarmic again under one.
+    unsigned inline_depth_ = 0;
+    // The host thread's FPCR, taken when run() enters translated code (see serve_inline).
+    std::uint64_t host_fpcr_ = 0;
 
     GuestMemory& mem_;
     std::size_t processor_id_;

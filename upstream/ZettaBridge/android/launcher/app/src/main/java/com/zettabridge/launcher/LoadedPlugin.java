@@ -77,8 +77,12 @@ final class LoadedPlugin {
         if (record.isTranslated()) RuntimeBundle.install(host);
         // Plugin dex is child-first and isolated from launcher implementation classes. Only the
         // stable com.zettabridge.core bridge is explicitly delegated to the launcher loader.
+        // Below the boot class path: the system libraries an installed app of this targetSdk
+        // would get implicitly (org.apache.http.legacy, android.test.base).
+        ClassLoader platform = ImplicitLibraries.parentFor(record.targetSdk,
+                android.content.Context.class.getClassLoader());
         ClassLoader cl = new PluginClassLoader(record, codeCache, RuntimeBundle.proxyLibrary(host),
-                android.content.Context.class.getClassLoader(), ZBridge.class.getClassLoader());
+                platform, ZBridge.class.getClassLoader());
 
         LoadedPlugin p = new LoadedPlugin(record, ai, res, cl);
         p.info = info;

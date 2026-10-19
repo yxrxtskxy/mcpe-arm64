@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 
 #include "zb/asset_backend.h"
@@ -46,15 +47,33 @@ private:
     AssetBackend& backend_;
     HostJni& host_jni_;
     // AAsset_getBuffer copies, since the NDK buffer lives outside the guest address space. An
-    // asset is read-only, so one copy per asset is enough and never needs writing back.
+    // asset is read-only, so one copy per asset is enough and never needs writing back. The copy
+    // lives until AAsset_close, as the NDK buffer does: the host AAsset* is the cache key, and
+    // the allocator hands the same pointer to the next asset opened after a close.
     std::uint32_t asset_buffer(std::uint64_t asset);
+    void release_asset_buffer(std::uint64_t asset);
+    // AAssetDir_getNextFileName: the name copied into a guest buffer owned by that directory
+    // (valid until the next call on it or AAssetDir_close, like the NDK's).
+    std::uint32_t next_file_name(std::uint32_t dir_handle, std::uint64_t dir);
+    void release_dir_buffer(std::uint32_t dir_handle);
+    std::uint32_t guest_malloc(std::uint32_t size);
+    void guest_free(std::uint32_t address);
 
     GlobalHandles managers_{HandleKind::Global};
     GlobalHandles assets_{HandleKind::Global};
+    GlobalHandles dirs_{HandleKind::Global};
     bool logged_overflow_ = false;
     static constexpr std::uint64_t kMaxBufferedBytes = 64ull << 20;
+    // Guest code loads assets from several threads; never held across a guest call.
+    std::mutex mutex_;
     std::unordered_map<std::uint64_t, std::uint32_t> asset_buffers_;
+    std::unordered_map<std::uint64_t, std::uint32_t> asset_buffer_sizes_;
     std::uint64_t buffered_bytes_ = 0;
+    struct NameBuffer {
+        std::uint32_t address = 0;
+        std::uint32_t capacity = 0;
+    };
+    std::unordered_map<std::uint32_t, NameBuffer> dir_names_;
 };
 
 }  // namespace zb

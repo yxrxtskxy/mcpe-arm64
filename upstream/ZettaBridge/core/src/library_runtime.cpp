@@ -58,6 +58,7 @@ struct ParkedCarrier {
 struct LibraryRuntime::Impl {
     Process process;
     Process::HostCallHandler chained;
+    std::vector<std::uint32_t> inline_host_calls;
     std::thread runner;
     mutable std::mutex mutex;
     std::condition_variable cv;
@@ -358,6 +359,15 @@ void LibraryRuntime::set_host_call_handler(Process::HostCallHandler handler) {
     impl_->chained = std::move(handler);
 }
 
+void LibraryRuntime::set_inline_host_calls(std::vector<std::uint32_t> indices) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->started) {
+        log("LibraryRuntime::set_inline_host_calls called after start");
+        std::abort();
+    }
+    impl_->inline_host_calls = std::move(indices);
+}
+
 bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& error) {
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -371,6 +381,7 @@ bool LibraryRuntime::start(const LibraryRuntimeOptions& options, std::string& er
     impl->process.set_sysroot(options.sysroot);
     impl->process.set_host_call_handler(
         [impl](std::uint32_t index, GuestThread& thread) { return impl->handle_host_call(index, thread); });
+    impl->process.set_inline_host_calls(impl->inline_host_calls);
     std::vector<std::string> argv = {options.zbhost, std::to_string(options.target_sdk)};
     if (!options.preload.empty()) argv.push_back(options.preload);
     impl->runner = std::thread([impl, argv, options] {

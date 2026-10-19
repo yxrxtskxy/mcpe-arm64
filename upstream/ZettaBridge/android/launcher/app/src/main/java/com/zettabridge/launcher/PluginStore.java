@@ -58,10 +58,20 @@ final class PluginStore {
     }
 
     static PluginRecord importApk(Context c, Uri uri) throws IOException {
-        File tmp = File.createTempFile("zb-import-", ".apk", c.getCacheDir());
         try (InputStream in = c.getContentResolver().openInputStream(uri)) {
             if (in == null) throw new IOException("cannot open " + uri);
-            copy(in, tmp);
+            return importApk(c, in);
+        }
+    }
+
+    /** Imports an APK read from any stream, for example one bundled in the launcher's assets. */
+    static PluginRecord importApk(Context c, InputStream source) throws IOException {
+        File tmp = File.createTempFile("zb-import-", ".apk", c.getCacheDir());
+        try {
+            copy(source, tmp);
+        } catch (IOException e) {
+            tmp.delete();
+            throw e;
         }
         PackageManager pm = c.getPackageManager();
         PackageInfo info = pm.getPackageArchiveInfo(tmp.getPath(), ARCHIVE_FLAGS);

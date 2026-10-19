@@ -158,6 +158,9 @@ static void* EmitExclusiveWriteCallTrampoline(oaknut::CodeGenerator& code, const
 A32AddressSpace::A32AddressSpace(const A32::UserConfig& conf)
         : AddressSpace(conf.code_cache_size)
         , conf(conf) {
+    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
+        AllocateFastDispatchTable();
+    }
     EmitPrelude();
 }
 
@@ -308,7 +311,7 @@ void A32AddressSpace::EmitPrelude() {
 
     prelude_info.return_to_dispatcher = code.xptr<void*>();
     {
-        oaknut::Label l_this, l_addr;
+        oaknut::Label l_this, l_addr, l_fast_dispatch_table, fast_dispatch_miss;
 
         code.LDAR(Wscratch0, Xhalt);
         code.CBNZ(Wscratch0, return_from_run_code);
@@ -318,6 +321,25 @@ void A32AddressSpace::EmitPrelude() {
             code.B(LE, return_from_run_code);
         }
 
+        if (fast_dispatch_table) {
+            // X0 = the location descriptor, as A32JitState::GetLocationDescriptor builds it.
+            static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
+            code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
+            // X2 = &fast_dispatch_table[FastDispatchIndex(X0)]
+            code.LSR(X1, X0, 1);
+            code.EOR(X1, X1, X0, LSR, 17);
+            code.EOR(X1, X1, X0, LSR, 32);
+            code.AND(X1, X1, fast_dispatch_table_size - 1);
+            code.LDR(X2, l_fast_dispatch_table);
+            code.ADD(X2, X2, X1, LSL, 4);
+            code.LDP(X3, X4, X2);
+            code.MVN(X0, X0);
+            code.CMP(X3, X0);
+            code.B(NE, fast_dispatch_miss);
+            code.BR(X4);
+            code.l(fast_dispatch_miss);
+        }
+
         code.LDR(X0, l_this);
         code.MOV(X1, Xstate);
         code.LDR(Xscratch0, l_addr);
@@ -325,7 +347,10 @@ void A32AddressSpace::EmitPrelude() {
         code.BR(X0);
 
         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
-            return self.GetOrEmit(context.GetLocationDescriptor());
+            const IR::LocationDescriptor descriptor = context.GetLocationDescriptor();
+            const CodePtr code_ptr = self.GetOrEmit(descriptor);
+            self.SetFastDispatchEntry(descriptor, code_ptr);
+            return code_ptr;
         };
 
         code.align(8);
@@ -333,6 +358,8 @@ void A32AddressSpace::EmitPrelude() {
         code.dx(mcl::bit_cast<u64>(this));
         code.l(l_addr);
         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
+        code.l(l_fast_dispatch_table);
+        code.dx(mcl::bit_cast<u64>(fast_dispatch_table));
     }
 
     prelude_info.return_from_run_code = code.xptr<void*>();

@@ -379,11 +379,15 @@ void check_throttle(const fs::path& dir) {
     zb::RuntimeReport report;
     CHECK(zb::write_runtime_report_to(report, path.string(), std::chrono::milliseconds(20)));
     for (int i = 0; i < 200; ++i) report.note_unimplemented_host_call(7, "libGLESv2.so", "glDrawArrays");
-    // Hot counter-only traffic is throttled, so the file lags behind on purpose.
     CHECK(report.unimplemented_host_calls() == 200);
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    report.note_unimplemented_host_call(7, "libGLESv2.so", "glDrawArrays");
-    CHECK(contains(read_file(path), "unimplemented-host-calls: 201"));
+    // Hot counter-only traffic never writes on the calling thread (the first call was the
+    // structural one); the background writer catches up within an interval or so.
+    bool caught_up = false;
+    for (int i = 0; i < 300 && !caught_up; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        caught_up = contains(read_file(path), "unimplemented-host-calls: 200");
+    }
+    CHECK(caught_up);
 }
 
 void check_process_wide_instance() {

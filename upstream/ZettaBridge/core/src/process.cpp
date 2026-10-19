@@ -1,12 +1,14 @@
 #include "zb/process.h"
 
 #include <elf.h>
+#include <sched.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <mutex>
 
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <future>
 #include <iterator>
 #include <string_view>
@@ -23,6 +26,7 @@
 
 #include <dynarmic/interface/exclusive_monitor.h>
 
+#include "zb/elf_fixups.h"
 #include "zb/elf_loader.h"
 #include "zb/hang_watchdog.h"
 #include "zb/initial_stack.h"
@@ -262,6 +266,9 @@ std::string Process::translate_path(const char* guest_path) const {
         const std::string* best_to = nullptr;
         for (const auto& [from, to] : path_aliases_) {
             if (path.substr(0, from.size()) != from) continue;
+            // A prefix without a trailing slash names a directory: it matches that directory and
+            // what is under it, never a sibling that merely starts with the same characters.
+            if (from.back() != '/' && path.size() > from.size() && path[from.size()] != '/') continue;
             if (best_from == nullptr || from.size() > best_from->size()) {
                 best_from = &from;
                 best_to = &to;
@@ -352,6 +359,7 @@ std::unique_ptr<GuestThread> Process::create_borrower(GuestThread& carrier) {
     if (processor_id < 0) return nullptr;
     auto borrower =
         std::make_unique<GuestThread>(mem_, monitor_.get(), static_cast<std::size_t>(processor_id), precise_faults_);
+    adopt_inline_host_calls(*borrower);
     borrower->regs().fill(0);
     borrower->regs()[13] = carrier.regs()[13] & ~7u;
     borrower->ext_regs().fill(0);
@@ -462,6 +470,7 @@ int Process::run(const std::string& path, const std::vector<std::string>& argv, 
 
     main_ = std::make_unique<GuestThread>(mem_, monitor_.get(), static_cast<std::size_t>(allocate_processor_id()),
                                           precise_faults_);
+    adopt_inline_host_calls(*main_);
     auto& regs = main_->regs();
     regs.fill(0);
     regs[13] = sp;
@@ -508,6 +517,10 @@ bool Process::dispatch_stop(GuestThread& thread, const Stop& stop) {
             if (exiting_ && thread_count() > 1) exit_host_process();
             return false;
         }
+        if (stop.swi >= kSpinWaitSvcBase && stop.swi <= kSpinWaitSvcLast) {
+            spin_wait(thread, thread.regs()[stop.swi - kSpinWaitSvcBase]);
+            return true;
+        }
         if (stop.swi == kHostReturnSwi) {
             // GuestThread::call consumes its own return; any other one is an illegal instruction.
             if (thread.call_depth == 0) log("host return svc outside a host-to-guest call at pc 0x%08x", stop.pc - 4);
@@ -518,45 +531,20 @@ bool Process::dispatch_stop(GuestThread& thread, const Stop& stop) {
             return fault_or_crash(thread, illegal);
         }
         if ((stop.swi & 0xFF0000u) == kHostCallBase) {
-            const std::uint32_t index = stop.swi & 0xFFFFu;
-            record_thread_activity(thread.tid, ThreadActivityKind::kHostCall, index);
-            // A host call is host C++ called from translated guest code, and an exception that
-            // escapes it has no frame above to catch it: the process dies with "terminating" and
-            // nothing else. The name of the call and the reason are worth far more than the
-            // abort, so they go into the report and the guest is stopped instead.
-            bool served = false;
-            try {
-                served = host_call_handler_ && host_call_handler_(index, thread);
-            } catch (const std::exception& failure) {
-                const auto [failed_library, failed_name] = host_call_name(index);
-                std::string detail = std::string(failed_library) + ":" + failed_name + ": " + failure.what();
-                log("host call %s threw: %s", failed_name, failure.what());
-                runtime_report().note_jni_detail("host-call-threw", detail, true);
-                record_thread_activity_done(thread.tid);
-                request_exit(70);
-                return false;
-            } catch (...) {
-                const auto [failed_library, failed_name] = host_call_name(index);
-                log("host call %s threw a non-standard exception", failed_name);
-                runtime_report().note_jni_detail("host-call-threw",
-                                                 std::string(failed_library) + ":" + failed_name, true);
-                record_thread_activity_done(thread.tid);
-                request_exit(70);
+            // Served inside translated code already; it stopped the thread for good.
+            if (thread.host_call_served) {
+                thread.host_call_served = false;
                 return false;
             }
-            if (served) {
-                record_thread_activity_done(thread.tid);
+            switch (serve_host_call(thread, stop.swi & 0xFFFFu)) {
+            case HostCallOutcome::Served:
                 return !exiting_;
+            case HostCallOutcome::Unimplemented:
+                return true;
+            case HostCallOutcome::Threw:
+                return false;
             }
-            const auto [library, name] = host_call_name(index);
-            if (first_time(kSeenHostCall | index)) {
-                log("host call %s:%s is not implemented yet", library, name);
-            }
-            // The guest keeps running with r0 = 0; the report is the only record that survives a
-            // device run, because OxygenOS drops our logcat output.
-            runtime_report().note_unimplemented_host_call(index, library, name);
-            thread.regs()[0] = 0;
-            return true;
+            return false;
         }
         if (first_time(kSeenUnexpectedSvc | stop.swi)) {
             log("unexpected svc #0x%x at pc 0x%08x", stop.swi, stop.pc);
@@ -577,6 +565,105 @@ bool Process::dispatch_stop(GuestThread& thread, const Stop& stop) {
     return false;
 }
 
+Process::HostCallOutcome Process::serve_host_call(GuestThread& thread, std::uint32_t index) {
+    record_thread_activity(thread.tid, ThreadActivityKind::kHostCall, index, thread.regs()[14], thread.regs()[13]);
+    // A host call is host C++ called from translated guest code, and an exception that escapes
+    // it has no frame above to catch it: the process dies with "terminating" and nothing else.
+    // The name of the call and the reason are worth far more than the abort, so they go into the
+    // report and the guest is stopped instead.
+    bool served = false;
+    try {
+        served = host_call_handler_ && host_call_handler_(index, thread);
+    } catch (const std::exception& failure) {
+        const auto [failed_library, failed_name] = host_call_name(index);
+        std::string detail = std::string(failed_library) + ":" + failed_name + ": " + failure.what();
+        log("host call %s threw: %s", failed_name, failure.what());
+        runtime_report().note_jni_detail("host-call-threw", detail, true);
+        record_thread_activity_done(thread.tid);
+        request_exit(70);
+        return HostCallOutcome::Threw;
+    } catch (...) {
+        const auto [failed_library, failed_name] = host_call_name(index);
+        log("host call %s threw a non-standard exception", failed_name);
+        runtime_report().note_jni_detail("host-call-threw", std::string(failed_library) + ":" + failed_name, true);
+        record_thread_activity_done(thread.tid);
+        request_exit(70);
+        return HostCallOutcome::Threw;
+    }
+    if (served) {
+        record_thread_activity_done(thread.tid);
+        return HostCallOutcome::Served;
+    }
+    const auto [library, name] = host_call_name(index);
+    if (first_time(kSeenHostCall | index)) {
+        log("host call %s:%s is not implemented yet", library, name);
+    }
+    // The guest keeps running with r0 = 0; the report is the only record that survives a device
+    // run, because OxygenOS drops our logcat output.
+    runtime_report().note_unimplemented_host_call(index, library, name);
+    thread.regs()[0] = 0;
+    return HostCallOutcome::Unimplemented;
+}
+
+void Process::set_inline_host_calls(const std::vector<std::uint32_t>& indices) {
+    for (const std::uint32_t index : indices) {
+        // The host return svc shares the encoding and is never a host call.
+        if (index > 0xFFFFu || (kHostCallBase | index) == kHostReturnSwi) continue;
+        inline_host_calls_[index / 64] |= std::uint64_t{1} << (index % 64);
+        has_inline_host_calls_ = true;
+    }
+}
+
+void Process::adopt_inline_host_calls(GuestThread& thread) {
+    if (has_inline_host_calls_) thread.set_inline_host_calls(this);
+}
+
+bool Process::accepts(std::uint32_t swi) const {
+    if ((swi & 0xFF0000u) != kHostCallBase) return false;
+    const std::uint32_t index = swi & 0xFFFFu;
+    return ((inline_host_calls_[index / 64] >> (index % 64)) & 1u) != 0;
+}
+
+bool Process::serve(std::uint32_t swi, GuestThread& thread) {
+    const HostCallOutcome outcome = serve_host_call(thread, swi & 0xFFFFu);
+    // As in dispatch_stop: a call that threw, or that finds the process exiting, ends the thread.
+    if (outcome != HostCallOutcome::Threw && !exiting_) return true;
+    thread.host_call_served = true;
+    return false;
+}
+
+// A rewritten spinlock found its lock taken (elf_fixups.cpp). Spinning in translated code took
+// whole cores from the thread that holds the lock, which then could not finish (Minecraft PE's
+// sound loading: seven workers spinning, the one holder starved). This waits on the lock byte
+// itself instead: a short spin with the CPU's yield hint for locks that are about to be released,
+// then giving the core away, then short sleeps. It returns as soon as the byte reads 0, after at
+// most about 10 ms, or when a guest signal is pending, and the guest retries its exchange.
+void Process::spin_wait(GuestThread& thread, std::uint32_t lock_address) {
+    const std::uint8_t* lock = mem_.host_ptr(lock_address, 1, kPageRead);
+    if (lock == nullptr) return;  // the retry faults the guest where the original would have
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+    for (unsigned round = 0;; ++round) {
+        if (__atomic_load_n(lock, __ATOMIC_ACQUIRE) == 0) return;
+        if (thread.has_pending_signals(thread.sigmask)) return;
+        if (round < 128) {
+#if defined(__aarch64__)
+            asm volatile("yield");
+#elif defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            continue;
+        }
+        if (round < 160) {
+            ::sched_yield();
+            continue;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return;
+        const unsigned shift = round - 160 < 5 ? round - 160 : 5;
+        timespec pause{0, static_cast<long>(20000u << shift)};  // 20 us .. 640 us
+        ::nanosleep(&pause, nullptr);
+    }
+}
+
 bool Process::fault_or_crash(GuestThread& thread, const Stop& stop) {
     if (deliver_fault(thread, stop)) return true;
     crash_report(stop, thread);
@@ -592,6 +679,43 @@ bool Process::after_stop(GuestThread& thread) {
 }
 
 Process* Process::reporter_process = nullptr;
+
+std::string Process::describe_guest_address(std::uint32_t addr) {
+    return reporter_process != nullptr ? reporter_process->describe_address(addr) : std::string("?");
+}
+
+void Process::request_profile_samples() {
+    Process* process = reporter_process;
+    if (process == nullptr) return;
+    std::lock_guard<std::mutex> lock(process->threads_mutex_);
+    for (GuestThread* t : process->threads_) {
+        if (!t->blocking()) t->request_profile_sample();
+    }
+    for (GuestThread* t : process->borrowers_) {
+        if (!t->blocking()) t->request_profile_sample();
+    }
+}
+
+std::string Process::describe_guest_stack(std::uint32_t sp, unsigned max_entries) {
+    Process* process = reporter_process;
+    if (process == nullptr) return {};
+    std::string out;
+    unsigned found = 0;
+    for (std::uint32_t i = 0; i < 512 && found < max_entries; ++i) {
+        const std::uint8_t* word = process->mem_.host_ptr(sp + 4 * i, 4, kPageRead);
+        if (word == nullptr) break;
+        std::uint32_t value;
+        std::memcpy(&value, word, 4);
+        if ((value & 1) == 0 && (value & 3) != 0) continue;  // neither Thumb nor ARM code alignment
+        std::string where = process->describe_address(value);
+        if (where == "?" || where.find("/libc.so") != std::string::npos) continue;
+        const std::size_t slash = where.rfind('/');
+        if (slash != std::string::npos) where = where.substr(slash + 1);
+        out += " " + where + " |";
+        ++found;
+    }
+    return out;
+}
 
 // The translator does not always throw when it cannot go on: a failed check inside it calls
 // std::terminate directly, and the process dies with the message "terminating" and a stripped
@@ -661,6 +785,7 @@ std::int32_t Process::clone_thread(GuestThread& parent, std::uint32_t flags, std
         parent.child_code_cache_size != 0 ? parent.child_code_cache_size : kDefaultCodeCacheSize;
     auto child = std::make_unique<GuestThread>(mem_, monitor_.get(), static_cast<std::size_t>(processor_id),
                                                precise_faults_, code_cache_size);
+    adopt_inline_host_calls(*child);
     child->regs() = parent.regs();
     child->regs()[0] = 0;
     if (stack != 0) child->regs()[13] = stack;

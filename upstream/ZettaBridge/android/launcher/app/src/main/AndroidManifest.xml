@@ -98,6 +98,19 @@
             android:process=":guest"
             android:taskAffinity="com.zettabridge.launcher.guest"
             android:theme="@android:style/Theme.Material.NoActionBar" />
+        <!-- Stands in for the gallery when a plugin picks an image: the system file picker, then a
+             private copy served by PickedImageProvider (GuestRuntime.route). -->
+        <activity
+            android:name=".ImagePickActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode"
+            android:exported="false"
+            android:process=":guest"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <provider
+            android:name=".PickedImageProvider"
+            android:authorities="${applicationId}.pickedimage"
+            android:exported="false"
+            android:process=":guest" />
         <!-- AndroidIDE injects the Kotlin-based LogWire logger into debug builds. This app has no
              Kotlin stdlib, so its init provider crashes the main process. Drop it. -->
         <provider

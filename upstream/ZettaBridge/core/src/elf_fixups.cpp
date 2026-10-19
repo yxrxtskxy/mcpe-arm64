@@ -22,6 +22,22 @@ namespace {
 constexpr std::uint32_t kMaxDynamicSize = 64 * 1024;
 constexpr std::uint64_t kMaxFileSize = 512ULL * 1024 * 1024;
 
+// Platform libraries with no arm32 copy in the guest sysroot and no host-call stubs. A DT_NEEDED
+// naming one of them can never be satisfied, so it becomes DT_ZB_DROPPED_NEEDED (elf_fixups.h).
+// Runtime dlopen of the same name keeps failing normally, which is what lets FMOD fall back from
+// OpenSL ES to its Java AudioTrack output.
+constexpr const char* kAbsentPlatformLibraries[] = {
+    "libOpenSLES.so",
+    "libOpenMAXAL.so",
+};
+
+bool is_absent_platform_library(const std::string& basename) {
+    for (const char* absent : kAbsentPlatformLibraries) {
+        if (basename == absent) return true;
+    }
+    return false;
+}
+
 class ScopedFd {
 public:
     explicit ScopedFd(int fd) : fd_(fd) {}
@@ -88,6 +104,71 @@ struct DynamicTable {
     std::size_t slots;
     std::size_t terminator;
 };
+
+std::uint16_t halfword(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8));
+}
+
+void set_halfword(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint16_t value) {
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+// The test-and-set loop GCC emits for a byte spinlock (std::atomic_flag), Thumb-2, 20 bytes:
+//   ldrexb rO,[rB]; strexb rS,rV,[rB]; cmp rS,#0; bne <ldrexb>; dmb ish; cmp rO,#0; bne <ldrexb>
+// A waiter in it holds a whole core. Native, the holder's critical section is over before that
+// matters; translated, the holder is slower and a pool of waiters on the same lock leaves it
+// almost no CPU at all (Minecraft PE: seven sound-loading workers spinning on one lock, loading
+// stalled for minutes). Each loop is rewritten in place, same 20 bytes, to one that steps aside
+// while the lock is taken:
+//   ldrexb rO,[rB]; strexb rS,rV,[rB]; dmb ish; orrs rS,rO; cbz rS,<done>; svc #0x50|rB; b <ldrexb>
+// The uncontended path is still one exchange. On leaving, rO and rS are 0 and Z is set as before;
+// C and V are left alone where the original's compare set C, so a site followed by an
+// instruction that reads flags (IT, a conditional branch) is not touched.
+constexpr std::size_t kSpinLoopBytes = 20;
+
+bool rewrite_spin_loop(std::vector<std::uint8_t>& bytes, std::size_t at) {
+    const auto h = [&](std::size_t i) { return halfword(bytes, at + 2 * i); };
+    if ((h(0) & 0xfff0) != 0xe8d0 || (h(1) & 0x0fff) != 0x0f4f) return false;  // ldrexb rO,[rB]
+    const unsigned base = h(0) & 0xf;
+    const unsigned old_value = h(1) >> 12;
+    if (h(2) != (0xe8c0 | base) || (h(3) & 0x0ff0) != 0x0f40) return false;  // strexb rS,rV,[rB]
+    const unsigned status = h(3) & 0xf;
+    if (old_value > 7 || status > 7 || old_value == status) return false;  // 16-bit encodings below
+    if (h(4) != (0x2800 | (status << 8)) || h(5) != 0xd1f9) return false;  // cmp rS,#0; bne -14
+    if (h(6) != 0xf3bf || h(7) != 0x8f5b) return false;                      // dmb ish
+    if (h(8) != (0x2800 | (old_value << 8)) || h(9) != 0xd1f5) return false; // cmp rO,#0; bne -22
+    if (at + kSpinLoopBytes + 2 <= bytes.size()) {
+        const std::uint16_t next = halfword(bytes, at + kSpinLoopBytes);
+        const bool it_block = (next & 0xff00) == 0xbf00 && (next & 0x000f) != 0;
+        const bool conditional_branch = next >= 0xd000 && next <= 0xddff;
+        if (it_block || conditional_branch) return false;
+    }
+    set_halfword(bytes, at + 8, 0xf3bf);                                            // dmb ish
+    set_halfword(bytes, at + 10, 0x8f5b);
+    set_halfword(bytes, at + 12, static_cast<std::uint16_t>(0x4300 | (old_value << 3) | status));  // orrs rS,rO
+    set_halfword(bytes, at + 14, static_cast<std::uint16_t>(0xb108 | status));  // cbz rS,+2 (the end)
+    set_halfword(bytes, at + 16, static_cast<std::uint16_t>(0xdf00 | kSpinWaitSvcBase | base));  // svc #0x50|rB
+    set_halfword(bytes, at + 18, 0xe7f5);                                         // b <ldrexb>
+    return true;
+}
+
+// Every such loop in the executable segments; returns the file offsets rewritten.
+std::vector<std::size_t> rewrite_spin_loops(std::vector<std::uint8_t>& bytes, const std::vector<Elf32_Phdr>& loads) {
+    std::vector<std::size_t> rewritten;
+    for (const auto& load : loads) {
+        if ((load.p_flags & PF_X) == 0) continue;
+        const std::size_t begin = load.p_offset & ~static_cast<std::size_t>(1);
+        const std::size_t end = static_cast<std::size_t>(load.p_offset) + load.p_filesz;
+        for (std::size_t at = begin; at + kSpinLoopBytes <= end; at += 2) {
+            if (rewrite_spin_loop(bytes, at)) {
+                rewritten.push_back(at);
+                at += kSpinLoopBytes - 2;
+            }
+        }
+    }
+    return rewritten;
+}
 
 bool vaddr_to_offset(const std::vector<Elf32_Phdr>& loads, std::uint32_t address,
                      std::size_t file_size, std::size_t* offset, std::size_t* available) {
@@ -229,7 +310,13 @@ ElfFixupReport fix_guest_library(const std::string& path) {
             if (nul == table_end) return error("unterminated DT_NEEDED string");
             const std::string name(first, nul);
             const std::size_t cut = name.find_last_of("/\\");
-            if (cut != std::string::npos) {
+            const std::string basename = cut == std::string::npos ? name : name.substr(cut + 1);
+            if (is_absent_platform_library(basename)) {
+                entry.d_tag = kDtZbDroppedNeeded;
+                write_object(bytes, entry_offset, entry);
+                changed_entries.push_back(entry_offset);
+                changes.push_back("DT_NEEDED " + name + " dropped (no guest copy of this platform library)");
+            } else if (cut != std::string::npos) {
                 const std::uint64_t new_value = static_cast<std::uint64_t>(string_index) + cut + 1;
                 if (new_value > std::numeric_limits<std::uint32_t>::max()) {
                     return error("DT_NEEDED basename offset overflows ELF32");
@@ -275,10 +362,19 @@ ElfFixupReport fix_guest_library(const std::string& path) {
     }
 
     if (textrel_changed) changes.push_back("DT_TEXTREL -> DT_ZB_TEXTREL");
-    if (changed_entries.empty()) return {ElfFixupStatus::Unchanged, {}, "unchanged"};
+    const std::vector<std::size_t> spin_loops = rewrite_spin_loops(bytes, loads);
+    if (!spin_loops.empty()) {
+        changes.push_back(std::to_string(spin_loops.size()) + " spinlock loops yield while the lock is taken");
+    }
+    if (changed_entries.empty() && spin_loops.empty()) return {ElfFixupStatus::Unchanged, {}, "unchanged"};
 
     for (const std::size_t offset : changed_entries) {
         if (!write_exact(fd.get(), bytes.data() + offset, sizeof(Elf32_Dyn), offset)) {
+            return error("write failed: " + std::string(std::strerror(errno)));
+        }
+    }
+    for (const std::size_t offset : spin_loops) {
+        if (!write_exact(fd.get(), bytes.data() + offset, kSpinLoopBytes, offset)) {
             return error("write failed: " + std::string(std::strerror(errno)));
         }
     }

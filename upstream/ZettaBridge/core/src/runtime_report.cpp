@@ -3,11 +3,13 @@
 #include <algorithm>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 #include "zb/log.h"
@@ -233,19 +235,17 @@ void RuntimeReport::note_signal_restart(std::uint32_t nr, const char* name,
 }
 
 void RuntimeReport::note_gl_call(const char* function, std::uint64_t host_tid) {
-    bool structural = false;
+    // Every GL call of the game lands here, thousands per frame: only the first one takes the
+    // lock and tells the observer. Later counts reach the file with the next write.
+    if (gl_call_total_.fetch_add(1, std::memory_order_relaxed) != 0) return;
     std::shared_ptr<Observer> observer;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ++gl_call_total_;
-        if (gl_call_total_ == 1) {
-            gl_first_call_function_ = function != nullptr ? function : "?";
-            gl_first_call_tid_ = host_tid;
-            structural = true;
-        }
+        gl_first_call_function_ = function != nullptr ? function : "?";
+        gl_first_call_tid_ = host_tid;
         observer = take_observer();
     }
-    if (observer) (*observer)(structural);
+    if (observer) (*observer)(true);
 }
 
 void RuntimeReport::note_gl_egl_context(bool current) {
@@ -481,8 +481,7 @@ std::string RuntimeReport::first_unimplemented_host_call() const {
 }
 
 std::uint64_t RuntimeReport::gl_calls() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return gl_call_total_;
+    return gl_call_total_.load(std::memory_order_relaxed);
 }
 
 std::string RuntimeReport::text() const {
@@ -592,9 +591,10 @@ std::string RuntimeReport::text() const {
         }
     }
 
-    append_count(out, "gl-calls", gl_call_total_);
+    append_count(out, "gl-calls", gl_call_total_.load(std::memory_order_relaxed));
     out += "gl-first-call: ";
-    if (gl_call_total_ == 0) {
+    // The first call's details are written just after its count, under the lock held here.
+    if (gl_first_call_function_.empty()) {
         out += "(none)";
     } else {
         out += gl_first_call_function_;
@@ -670,7 +670,7 @@ void RuntimeReport::clear() {
     native_calls_overflow_.count.store(0, std::memory_order_relaxed);
     opened_paths_.clear();
     failed_opens_.clear();
-    gl_call_total_ = 0;
+    gl_call_total_.store(0, std::memory_order_relaxed);
     gl_first_call_function_.clear();
     gl_first_call_tid_ = 0;
     gl_egl_context_known_ = false;
@@ -705,8 +705,6 @@ namespace {
 // Rewrites one file from a RuntimeReport. Shared by the observer and owned by it.
 class ReportWriter {
 public:
-    using Clock = std::chrono::steady_clock;
-
     ReportWriter(RuntimeReport& report, std::string path, std::chrono::milliseconds min_interval)
         : report_(report), path_(std::move(path)), temporary_(path_ + ".tmp"), min_interval_(min_interval) {}
 
@@ -734,12 +732,33 @@ public:
         return true;
     }
 
+    // A structural change is written at once by the thread that made it: they are rare, and a
+    // process that dies right after one must still leave it on disk. Counter-only changes come
+    // from the game's hot paths (every frame, every looper poll) and only mark the file stale for
+    // flush_stale(): a write ends in fsync, which took milliseconds out of a frame whenever the
+    // render thread was the one to do it.
     void operator()(bool structural) {
+        if (!structural) {
+            stale_.store(true, std::memory_order_relaxed);
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
-        const Clock::time_point now = Clock::now();
-        if (!structural && now - last_ < min_interval_) return;
-        last_ = now;
+        stale_.store(false, std::memory_order_relaxed);
         write_now();
+    }
+
+    // Runs on its own thread until the report drops its observer, and with it the writer; the
+    // process-wide report never does.
+    static void flush_stale(const std::weak_ptr<ReportWriter>& weak, std::chrono::milliseconds interval) {
+        pthread_setname_np(pthread_self(), "zb-report");
+        for (;;) {
+            std::this_thread::sleep_for(interval);
+            const std::shared_ptr<ReportWriter> writer = weak.lock();
+            if (!writer) return;
+            if (!writer->stale_.exchange(false, std::memory_order_relaxed)) continue;
+            std::lock_guard<std::mutex> lock(writer->mutex_);
+            writer->write_now();
+        }
     }
 
 private:
@@ -748,7 +767,7 @@ private:
     std::string temporary_;
     std::chrono::milliseconds min_interval_;
     std::mutex mutex_;
-    Clock::time_point last_ = Clock::time_point::min();
+    std::atomic<bool> stale_{false};
 };
 
 }  // namespace
@@ -761,6 +780,9 @@ bool write_runtime_report_to(RuntimeReport& report, const std::string& path,
         return false;
     }
     report.set_observer([writer](bool structural) { (*writer)(structural); });
+    std::thread([weak = std::weak_ptr<ReportWriter>(writer), min_interval] {
+        ReportWriter::flush_stale(weak, min_interval);
+    }).detach();
     return true;
 }
 

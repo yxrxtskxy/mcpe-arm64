@@ -1,5 +1,5 @@
 # LF in every checkout, also on Windows with core.autocrlf=true: sh rejects scripts with CRLF, and
-# git apply needs the patches byte for byte (they also carry binary hunks).
+# git apply needs patches (ZettaBridge's third_party/patches) byte for byte.
 * text=auto eol=lf
 *.patch -text
 # Committed with CRLF upstream (Dynarmic's bundled xbyak): kept byte for byte.

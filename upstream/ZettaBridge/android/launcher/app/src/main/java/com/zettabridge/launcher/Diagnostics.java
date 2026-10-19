@@ -18,11 +18,12 @@ import java.util.Locale;
 
 /**
  * Error reports that do not depend on logcat: some ROMs (OxygenOS) drop third-party app logs.
- * The full stack trace goes to the clipboard and to
- * /sdcard/Android/data/com.zettabridge.launcher/files/zb-errors.txt (appended).
+ * The full stack trace goes to the clipboard and to filesDir/zb-errors.txt (appended).
  *
  * <p>The translator's own runtime report lands next to it as zb-runtime-report.txt, rewritten by
  * the :guest process whenever it changes, so it survives a :guest process that dies silently.
+ * Both live in internal storage: scoped storage keeps `adb shell run-as` out of the external
+ * app directory, and run-as on a debuggable build is how the reports leave the phone.
  */
 final class Diagnostics {
     private static final String TAG = "zb-launcher";
@@ -30,9 +31,9 @@ final class Diagnostics {
 
     private Diagnostics() {}
 
-    /** The runtime report file, or null when external storage is unavailable. */
+    /** The runtime report file, or null when the files directory is unavailable. */
     static File runtimeReportFile(Context context) {
-        File dir = context.getExternalFilesDir(null);
+        File dir = context.getFilesDir();
         return dir == null ? null : new File(dir, REPORT_NAME);
     }
 
@@ -43,7 +44,7 @@ final class Diagnostics {
     static void startRuntimeReport(Context context) {
         File file = runtimeReportFile(context);
         if (file == null) {
-            Log.w(TAG, "no external files dir: the runtime report is not persisted");
+            Log.w(TAG, "no files dir: the runtime report is not persisted");
             return;
         }
         try {
@@ -108,7 +109,7 @@ final class Diagnostics {
 
     private static void appendToFile(Context context, String text) {
         try {
-            File dir = context.getExternalFilesDir(null);
+            File dir = context.getFilesDir();
             if (dir == null) return;
             try (FileOutputStream out = new FileOutputStream(new File(dir, "zb-errors.txt"), true)) {
                 out.write((text + "\n").getBytes(StandardCharsets.UTF_8));

@@ -152,6 +152,8 @@ add_executable(host_call_dispatch_test host_call_dispatch_test.cpp)
 target_link_libraries(host_call_dispatch_test PRIVATE zbcore)
 add_test(NAME host_call_dispatch_test COMMAND host_call_dispatch_test
     ${CMAKE_SOURCE_DIR}/build/guest/host_call_static)
+add_test(NAME host_call_dispatch_test_inline COMMAND host_call_dispatch_test
+    ${CMAKE_SOURCE_DIR}/build/guest/host_call_static inline)
 
 add_executable(zbhost_protocol_test zbhost_protocol_test.cpp)
 target_link_libraries(zbhost_protocol_test PRIVATE zbcore)

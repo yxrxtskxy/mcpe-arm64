@@ -43,7 +43,9 @@ final class PluginContext extends ContextWrapper {
     private PluginContext(Context base, LoadedPlugin plugin, Resources resources) {
         super(base);
         this.plugin = plugin;
-        this.resources = resources;
+        // Lookups by name in the launcher's package (getIdentifier(.., getPackageName())) are
+        // lookups in the plugin's package; see PluginResources.
+        this.resources = PluginResources.wrap(resources, base.getPackageName(), plugin.packageName);
     }
 
     /** Wraps a context derived by the framework, with plugin resources in its configuration. */
@@ -57,12 +59,12 @@ final class PluginContext extends ContextWrapper {
 
     @Override
     public Resources getResources() {
-        return resources;
+        return PluginResources.sync(resources);
     }
 
     @Override
     public AssetManager getAssets() {
-        return resources.getAssets();
+        return getResources().getAssets();
     }
 
     @Override
@@ -295,5 +297,39 @@ final class PluginContext extends ContextWrapper {
     @Override
     public File[] getObbDirs() {
         return new File[] {getObbDir()};
+    }
+
+    // Receivers. From targetSdk 34 a receiver for anything but protected system broadcasts must
+    // say whether it is exported, and the check uses the host's targetSdk, not the plugin's. An
+    // app built for an older SDK never says, and its receivers were exported; it gets the same
+    // here instead of a SecurityException (Minecraft PE's Play billing receiver hit exactly that).
+    @Override
+    public android.content.Intent registerReceiver(android.content.BroadcastReceiver receiver,
+            android.content.IntentFilter filter) {
+        return registerReceiver(receiver, filter, null, null, 0);
+    }
+
+    @Override
+    public android.content.Intent registerReceiver(android.content.BroadcastReceiver receiver,
+            android.content.IntentFilter filter, int flags) {
+        return registerReceiver(receiver, filter, null, null, flags);
+    }
+
+    @Override
+    public android.content.Intent registerReceiver(android.content.BroadcastReceiver receiver,
+            android.content.IntentFilter filter, String broadcastPermission, android.os.Handler scheduler) {
+        return registerReceiver(receiver, filter, broadcastPermission, scheduler, 0);
+    }
+
+    @Override
+    public android.content.Intent registerReceiver(android.content.BroadcastReceiver receiver,
+            android.content.IntentFilter filter, String broadcastPermission, android.os.Handler scheduler, int flags) {
+        return super.registerReceiver(receiver, filter, broadcastPermission, scheduler, implicitExport(flags));
+    }
+
+    private int implicitExport(int flags) {
+        if (android.os.Build.VERSION.SDK_INT < 33 || plugin.appInfo.targetSdkVersion >= 34) return flags;
+        if ((flags & (Context.RECEIVER_EXPORTED | Context.RECEIVER_NOT_EXPORTED)) != 0) return flags;
+        return flags | Context.RECEIVER_EXPORTED;
     }
 }

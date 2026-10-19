@@ -41,6 +41,9 @@ public:
 
     // Receives every host call outside the runtime range 0xFE00-0xFEFF. Call before start().
     void set_host_call_handler(Process::HostCallHandler handler);
+    // The indices among those whose handling never runs guest code; see
+    // Process::set_inline_host_calls. Call before start().
+    void set_inline_host_calls(std::vector<std::uint32_t> indices);
     bool start(const LibraryRuntimeOptions& options, std::string& error);
 
     // Guest dlopen/dlsym/dlerror on the service thread. Flags are ZB_GUEST_RTLD_* values.

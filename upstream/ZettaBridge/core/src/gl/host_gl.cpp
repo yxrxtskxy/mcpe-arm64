@@ -80,6 +80,20 @@ bool gl_trace_enabled() {
 
 }  // namespace
 
+bool HostGl::reenters_guest(std::uint32_t index) {
+    switch (index) {
+    case ZB_GL_HC_glGetString:
+    case ZB_GL_HC_glGetStringi:
+    case ZB_GL_HC_glMapBufferRange:
+    case ZB_GL_HC_glUnmapBuffer:
+    case ZB_GL_HC_glMapBufferOES:
+    case ZB_GL_HC_glUnmapBufferOES:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
     if (!is_gl_host_call(index)) return false;
     const char* name = gl_host_call_name(index);
@@ -87,7 +101,8 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
         log("GLES trace: %s(0x%x, 0x%x, 0x%x, 0x%x)", name, thread.regs()[0], thread.regs()[1],
             thread.regs()[2], thread.regs()[3]);
     }
-    const std::uint64_t host_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+    // A thread's id never changes, and the syscall cost more than many of the GL calls it labels.
+    static thread_local const std::uint64_t host_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
     runtime_report().note_gl_call(name, host_tid);
     const std::uint64_t egl_generation = runtime_report().egl_current_generation();
     if (egl_generation != gl_thread_sampled_generation_) {

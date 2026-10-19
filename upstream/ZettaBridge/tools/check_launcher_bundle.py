@@ -52,7 +52,8 @@ def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: check_launcher_bundle.py build/launcher")
     root = pathlib.Path(sys.argv[1])
-    actual = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
+    # as_posix: the expected names use "/", which str() of a Windows path does not.
+    actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
     if actual != RUNTIME:
         missing = sorted(RUNTIME - actual)
         extra = sorted(actual - RUNTIME)

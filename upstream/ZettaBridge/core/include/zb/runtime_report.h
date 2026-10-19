@@ -195,7 +195,8 @@ private:
     std::vector<std::string> opened_paths_;
     std::vector<std::pair<std::string, int>> failed_opens_;
 
-    std::uint64_t gl_call_total_ = 0;
+    // Counted on every GL call, on the render thread, so without the lock (see note_gl_call).
+    std::atomic<std::uint64_t> gl_call_total_{0};
     std::string gl_first_call_function_;
     std::uint64_t gl_first_call_tid_ = 0;
     bool gl_egl_context_known_ = false;
@@ -212,7 +213,8 @@ private:
     std::vector<std::pair<std::string, std::string>> crash_details_;
     static constexpr std::size_t kMaxJniDetails = 16;
     std::vector<std::pair<std::string, std::string>> jni_details_;
-    static constexpr std::size_t kMaxWatchDetails = 8;
+    // Room for the census, the stuck notes and a full thread dump (one key per guest thread).
+    static constexpr std::size_t kMaxWatchDetails = 80;
     std::vector<std::pair<std::string, std::string>> watch_details_;
     static constexpr std::size_t kMaxLooperDetails = 16;
     std::vector<std::pair<std::string, std::string>> looper_details_;
@@ -238,9 +240,9 @@ RuntimeReport& runtime_report();
 
 // Installs an observer on `report` that rewrites `path` with text() whenever the report
 // changes, atomically (a sibling temporary file, fsync, rename), so a process that dies
-// silently still leaves the last state on disk. Structural changes are written at once,
-// counter-only changes at most once per min_interval. Returns false, and installs nothing, when
-// the first write fails.
+// silently still leaves the last state on disk. Structural changes are written at once by the
+// thread that makes them; counter-only changes by a background thread, at most once per
+// min_interval. Returns false, and installs nothing, when the first write fails.
 bool write_runtime_report_to(RuntimeReport& report, const std::string& path,
                              std::chrono::milliseconds min_interval = std::chrono::milliseconds(1000));
 

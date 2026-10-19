@@ -24,7 +24,7 @@ class ExclusiveMonitor;
 namespace zb {
 
 // One guest process: its address space, emulated kernel state and threads.
-class Process {
+class Process : private InlineHostCalls {
 public:
     using HostCallHandler = std::function<bool(std::uint32_t index, GuestThread& thread)>;
 
@@ -52,6 +52,9 @@ public:
     // Handles svc #(0x5A0000 | index) before the generated host-call table; returns true if it
     // handled the index. Set before run().
     void set_host_call_handler(HostCallHandler handler) { host_call_handler_ = std::move(handler); }
+    // Host call indices whose handler never runs guest code: they are served inside translated
+    // code (InlineHostCalls) through the same handler. Set before run().
+    void set_inline_host_calls(const std::vector<std::uint32_t>& indices);
     // Runs a guest function on `thread`, which is stopped outside Dynarmic (typically inside a
     // host call), through the same stop dispatch as the thread's own loop. Returns nullopt when
     // the call cannot be laid out or the guest cannot continue:
@@ -164,6 +167,17 @@ public:
     void forget_mappings(std::uint32_t start, std::uint64_t length);
     // "libc.so offset 0x1234" style description, or "?" if the address is not file-backed.
     std::string describe_address(std::uint32_t addr) const;
+    // The same for the process running the guest, for host units that only hold a GuestThread
+    // (a rejected host call naming its caller); "?" before that process has started.
+    static std::string describe_guest_address(std::uint32_t addr);
+    // " lib+off | lib+off ..." for the first `max_entries` words on the guest stack from `sp`
+    // that point into a mapped file other than the C library: the call chain of a waiting thread.
+    static std::string describe_guest_stack(std::uint32_t sp, unsigned max_entries);
+    // The sampling profiler's tick: asks every guest thread that is running guest code (not
+    // blocked in a syscall) for a sample.
+    static void request_profile_samples();
+    // svc #0x50|rB from a rewritten spinlock (elf_fixups.h): waits until the lock byte is free.
+    void spin_wait(GuestThread& thread, std::uint32_t lock_address);
 
     // Executable segments of libraries marked DT_ZB_TEXTREL (see elf_fixups.h). They stay
     // writable inside the emulator so text relocations can be applied. forget_mappings drops them.
@@ -186,10 +200,19 @@ private:
         bool offset_is_vaddr;
     };
 
+    enum class HostCallOutcome { Served, Unimplemented, Threw };
+
     int allocate_processor_id();
     void register_thread(GuestThread* thread);
     // Handles one stop; true if the thread may resume.
     bool dispatch_stop(GuestThread& thread, const Stop& stop);
+    // Runs one host call and leaves its result in the guest registers. Threw: it was reported
+    // and the process is exiting.
+    HostCallOutcome serve_host_call(GuestThread& thread, std::uint32_t index);
+    // InlineHostCalls, for the indices set_inline_host_calls() named.
+    bool accepts(std::uint32_t swi) const override;
+    bool serve(std::uint32_t swi, GuestThread& thread) override;
+    void adopt_inline_host_calls(GuestThread& thread);
     // Delivers pending unblocked signals after a stop; false if one ended the guest.
     bool after_stop(GuestThread& thread);
     // A fault or exception becomes a guest signal, or a crash report and process exit.
@@ -237,6 +260,9 @@ private:
     std::atomic<bool> exiting_{false};
     std::atomic<int> exit_status_{0};
     HostCallHandler host_call_handler_;
+    // One bit per host call index.
+    std::array<std::uint64_t, 0x10000 / 64> inline_host_calls_{};
+    bool has_inline_host_calls_ = false;
 };
 
 }  // namespace zb

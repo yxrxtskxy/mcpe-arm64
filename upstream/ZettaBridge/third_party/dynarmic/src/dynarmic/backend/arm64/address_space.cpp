@@ -4,6 +4,9 @@
  */
 
 #include <cstdio>
+#include <cstring>
+
+#include <sys/mman.h>
 
 #include <mcl/bit_cast.hpp>
 
@@ -33,7 +36,36 @@ AddressSpace::AddressSpace(size_t code_cache_size)
     });
 }
 
-AddressSpace::~AddressSpace() = default;
+AddressSpace::~AddressSpace() {
+    if (fast_dispatch_table) {
+        munmap(fast_dispatch_table, fast_dispatch_table_size * sizeof(FastDispatchEntry));
+    }
+}
+
+void AddressSpace::AllocateFastDispatchTable() {
+    void* table = mmap(nullptr, fast_dispatch_table_size * sizeof(FastDispatchEntry), PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Without it the dispatcher only loses its shortcut.
+    fast_dispatch_table = table == MAP_FAILED ? nullptr : static_cast<FastDispatchEntry*>(table);
+}
+
+void AddressSpace::ClearFastDispatchTable() {
+    if (!fast_dispatch_table) {
+        return;
+    }
+    // Fresh zero pages in place, which also gives back the ones entries were written to.
+    void* table = mmap(fast_dispatch_table, fast_dispatch_table_size * sizeof(FastDispatchEntry),
+                       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (table == MAP_FAILED) {
+        std::memset(fast_dispatch_table, 0, fast_dispatch_table_size * sizeof(FastDispatchEntry));
+    }
+}
+
+void AddressSpace::SetFastDispatchEntry(IR::LocationDescriptor descriptor, CodePtr code_ptr) {
+    if (fast_dispatch_table) {
+        fast_dispatch_table[FastDispatchIndex(descriptor.Value())] = {~descriptor.Value(), code_ptr};
+    }
+}
 
 CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
     if (const auto iter = block_entries.find(descriptor); iter != block_entries.end()) {
@@ -74,6 +106,13 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
     UnprotectCodeMemory();
 
     for (const auto& descriptor : descriptors) {
+        if (fast_dispatch_table) {
+            FastDispatchEntry& entry = fast_dispatch_table[FastDispatchIndex(descriptor.Value())];
+            if (entry.inverted_descriptor == ~descriptor.Value()) {
+                entry = {};
+            }
+        }
+
         const auto iter = block_entries.find(descriptor);
         if (iter == block_entries.end()) {
             continue;
@@ -90,6 +129,7 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 }
 
 void AddressSpace::ClearCache() {
+    ClearFastDispatchTable();
     block_entries.clear();
     reverse_block_entries.clear();
     block_infos.clear();

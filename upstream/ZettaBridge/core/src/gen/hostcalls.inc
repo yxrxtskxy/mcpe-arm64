@@ -578,3 +578,8 @@
 {576, "libGLESv1_CM.so", "glTranslatef"},
 {577, "libGLESv1_CM.so", "glTranslatex"},
 {578, "libGLESv1_CM.so", "glVertexPointer"},
+{579, "libandroid.so", "ANativeActivity_finish"},
+{580, "libandroid.so", "ANativeActivity_hideSoftInput"},
+{581, "libandroid.so", "ANativeActivity_setWindowFlags"},
+{582, "libandroid.so", "ANativeActivity_setWindowFormat"},
+{583, "libandroid.so", "ANativeActivity_showSoftInput"},

@@ -186,6 +186,32 @@ bool Process::deliver_fault(GuestThread& thread, const Stop& stop) {
         info.fields[0] = stop.pc;
         thread.regs()[15] = stop.pc;
     }
+    // A guest that installs its own crash handler (Breakpad, Unity, Mono) takes every fault from
+    // here on, and whatever it does next is all that reaches the log: the fault itself was silent.
+    // The first few are named, with the library offsets, before the handler sees them. Memory
+    // faults stop at the end of the translated block unless precise faults are on.
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        const auto& r = thread.regs();
+        if (stop.kind == StopKind::MemoryFault) {
+            log("guest SIGSEGV (%s of 0x%08x) at pc 0x%08x %s, lr %s, going to the guest's handler",
+                stop.fault_write ? "write" : "read", stop.fault_addr, stop.pc, describe_address(stop.pc).c_str(),
+                describe_address(r[14]).c_str());
+        } else {
+            using E = Dynarmic::A32::Exception;
+            const char* kind = stop.exception == E::UndefinedInstruction ? "undefined instruction"
+                               : stop.exception == E::NoExecuteFault     ? "jump to non-executable memory"
+                               : stop.exception == E::Breakpoint         ? "breakpoint"
+                                                                         : "exception";
+            log("guest SIG%s (%s %d) at pc 0x%08x %s, lr %s, going to the guest's handler",
+                info.si_signo == SIGTRAP ? "TRAP" : "ILL", kind, static_cast<int>(stop.exception), stop.pc,
+                describe_address(stop.pc).c_str(), describe_address(r[14]).c_str());
+        }
+        log("  r0 %08x r1 %08x r2 %08x r3 %08x r4 %08x r5 %08x r6 %08x r7 %08x", r[0], r[1], r[2], r[3], r[4],
+            r[5], r[6], r[7]);
+        log("  r8 %08x r9 %08x r10 %08x r11 %08x r12 %08x sp %08x lr %08x cpsr %08x", r[8], r[9], r[10], r[11],
+            r[12], r[13], r[14], thread.cpsr());
+    }
     return deliver_signal(thread, info, true);
 }
 

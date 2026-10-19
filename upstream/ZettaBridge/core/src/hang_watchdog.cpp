@@ -5,13 +5,23 @@
 
 #include <dirent.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <thread>
 
 #include "zb/host_jni.h"
+#include "zb/log.h"
+#include "zb/process.h"
 #include "zb/runtime_report.h"
 #include "zb/syscalls.h"
 
@@ -30,10 +40,58 @@ struct Slot {
     std::atomic<std::uint8_t> kind{static_cast<std::uint8_t>(ThreadActivityKind::kNone)};
     std::atomic<std::uint32_t> id{0};
     std::atomic<std::uint64_t> counter{0};
+    std::atomic<std::uint32_t> guest_lr{0};
+    std::atomic<std::uint32_t> guest_sp{0};
 };
 
 Slot g_slots[kMaxSlots];
 
+}  // namespace
+
+namespace {
+std::mutex g_profile_mutex;
+std::unordered_map<std::uint32_t, std::uint64_t> g_profile;
+std::uint64_t g_profile_total = 0;
+}  // namespace
+
+bool profiling_enabled() {
+    static const bool enabled = [] {
+        if (std::getenv("ZB_PROFILE") != nullptr) return true;
+#ifdef __ANDROID__
+        char value[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.zb.profile", value) > 0) return value[0] == '1';
+#endif
+        return false;
+    }();
+    return enabled;
+}
+
+void record_profile_sample(std::uint32_t guest_pc) {
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    ++g_profile[guest_pc];
+    ++g_profile_total;
+}
+
+namespace {
+// Logs the hottest guest blocks since the last report and starts counting afresh.
+void report_profile() {
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> hot;
+    std::uint64_t total;
+    {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        hot.assign(g_profile.begin(), g_profile.end());
+        total = g_profile_total;
+        g_profile.clear();
+        g_profile_total = 0;
+    }
+    if (total == 0) return;
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    log("profile: %llu samples", static_cast<unsigned long long>(total));
+    for (std::size_t i = 0; i < hot.size() && i < 30; ++i) {
+        log("profile: %5.1f%% 0x%08x %s", 100.0 * static_cast<double>(hot[i].second) / static_cast<double>(total),
+            hot[i].first, Process::describe_guest_address(hot[i].first).c_str());
+    }
+}
 }  // namespace
 
 void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id) {
@@ -79,6 +137,26 @@ void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint
     mine_tid = tid;
 }
 
+void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id, std::uint32_t guest_lr,
+                            std::uint32_t guest_sp) {
+    record_thread_activity(tid, kind, id);
+    static thread_local Slot* mine = nullptr;
+    static thread_local std::int32_t mine_tid = 0;
+    if (mine == nullptr || mine_tid != tid) {
+        mine = nullptr;
+        for (Slot& slot : g_slots) {
+            if (slot.tid.load(std::memory_order_relaxed) == tid) {
+                mine = &slot;
+                mine_tid = tid;
+                break;
+            }
+        }
+        if (mine == nullptr) return;
+    }
+    mine->guest_lr.store(guest_lr, std::memory_order_relaxed);
+    mine->guest_sp.store(guest_sp, std::memory_order_relaxed);
+}
+
 void record_thread_activity_done(std::int32_t tid) {
     for (Slot& slot : g_slots) {
         if (slot.tid.load(std::memory_order_relaxed) == tid) {
@@ -99,6 +177,8 @@ std::vector<ThreadActivitySample> snapshot_thread_activity() {
         sample.id = slot.id.load(std::memory_order_relaxed);
         sample.counter = slot.counter.load(std::memory_order_relaxed);
         sample.in_progress = slot.in_progress.load(std::memory_order_relaxed);
+        sample.guest_lr = slot.guest_lr.load(std::memory_order_relaxed);
+        sample.guest_sp = slot.guest_sp.load(std::memory_order_relaxed);
         out.push_back(sample);
     }
     return out;
@@ -202,6 +282,21 @@ void write_threads_census() {
     runtime_report().note_watch_detail("threads-platform", std::to_string(platform) + " runtime threads hidden");
 }
 
+// Every guest thread once, with where it is: its last syscall or host call, the guest return
+// address of that call and the code addresses on its guest stack (a poor man's backtrace, enough
+// to see which wait in which library a stalled thread is in).
+void write_thread_dump(const std::vector<ThreadActivitySample>& samples) {
+    unsigned written = 0;
+    for (const ThreadActivitySample& sample : samples) {
+        if (written >= 48) break;
+        std::string line = describe_thread_activity(sample) + " " + thread_kernel_state(sample.tid);
+        if (sample.guest_lr != 0) line += " lr=" + Process::describe_guest_address(sample.guest_lr);
+        if (sample.guest_sp != 0) line += " stack:" + Process::describe_guest_stack(sample.guest_sp, 10);
+        runtime_report().note_watch_detail("dump-" + std::to_string(sample.tid), line);
+        ++written;
+    }
+}
+
 std::string describe_thread_activity(const ThreadActivitySample& sample) {
     char text[64];
     switch (sample.kind) {
@@ -222,6 +317,10 @@ HangWatchdog::HangWatchdog(SnapshotFn snapshot) : snapshot_(std::move(snapshot))
 
 bool HangWatchdog::sample(Clock::time_point now) {
     const std::vector<ThreadActivitySample> current = snapshot_();
+    // Where every guest thread is, rewritten every five samples whether or not anything counts as
+    // stuck: a stall made of timed waits keeps every counter moving.
+    static unsigned samples = 0;
+    if (++samples % 5 == 0) write_thread_dump(current);
 
     std::vector<State> next;
     next.reserve(current.size());
@@ -283,6 +382,7 @@ bool HangWatchdog::sample(Clock::time_point now) {
         write_threads_census();
     }
 
+
     ++notes_written_;
     runtime_report().note_watch_detail(std::to_string(notes_written_), value);
     return true;
@@ -303,6 +403,17 @@ void start_hang_watchdog() {
         HangWatchdog watchdog;
         watchdog.run_forever();
     }).detach();
+    if (profiling_enabled()) {
+        log("profiler on: sampling every guest thread at 200 Hz");
+        std::thread([]() {
+            unsigned ticks = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                Process::request_profile_samples();
+                if (++ticks % 2000 == 0) report_profile();  // every 10 s
+            }
+        }).detach();
+    }
 }
 
 }  // namespace zb

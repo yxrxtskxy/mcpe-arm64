@@ -1,7 +1,7 @@
-/* Indirect branches through Dynarmic's dispatcher and its arm64 fast-dispatch table
- * (patches/dynarmic): calls through function pointers between ARM and Thumb code, two generated
- * stubs that share one table slot, and a stub rewritten in place, whose old translation the
- * table must forget after cacheflush.
+/* Indirect branches through Dynarmic's dispatcher and its arm64 fast-dispatch table (this
+ * project's Dynarmic change): calls through function pointers between ARM and Thumb code, two
+ * generated stubs that share one table slot, and a stub rewritten in place, whose old translation
+ * the table must forget after cacheflush.
  *
  * Build with armv7a clang -O2, then `zbrun indirect_dispatch [rounds]`.
  */

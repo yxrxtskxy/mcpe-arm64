@@ -11,15 +11,14 @@
 #
 # Where each piece comes from (each is skipped once present):
 #   Android SDK, NDK r29, JDK 17, Gradle   tools/setup_toolchain_windows.sh, checksum-verified
-#   upstream/ZettaBridge                   tools/fetch_zettabridge.sh: pinned commits + patches/
 #   arm32 sysroot                          upstream tools/extract_sysroot.sh, in WSL (debugfs)
 #   Boost headers                          WSL's libboost-dev, copied into .deps/boost-headers
 #   signing key                            tools/make_signing_key.sh (~/.mcpe-arm64; back it up)
 # Needs on PATH: git, curl, unzip, cmake, ninja, python3. WSL only while the sysroot or the Boost
 # headers are missing.
 #
-# For quick test builds while changing the runtime, use tools/build_apk.sh: this script refuses to
-# build from a ZettaBridge checkout that patches/ does not reproduce.
+# For quick test builds while changing the code, use tools/build_apk.sh: this script refuses to
+# build with uncommitted changes, since such a release could not be rebuilt later.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ZB="$ROOT/upstream/ZettaBridge"
@@ -49,27 +48,8 @@ in_wsl() {
     MSYS_NO_PATHCONV=1 wsl.exe -d "$WSL_DISTRO" --exec sh -c "$snippet" sh "$@"
 }
 
-SCRATCH=$(mktemp -d)
-trap 'rm -rf "$SCRATCH"' EXIT
-INDEX="$(cygpath -m "$SCRATCH")/index"
-# The tree a fresh tools/fetch_zettabridge.sh would check out: HEAD plus the patches, in order.
-patched_tree() {  # repo patch...
-    repo=$1
-    shift
-    rm -f "$INDEX"
-    GIT_INDEX_FILE="$INDEX" git -C "$repo" read-tree HEAD
-    for patch in "$@"; do
-        GIT_INDEX_FILE="$INDEX" git -C "$repo" apply --cached --whitespace=nowarn "$patch"
-    done
-    GIT_INDEX_FILE="$INDEX" git -C "$repo" write-tree
-}
-# The tree actually checked out: tracked files (git add -N ones included) as they are on disk.
-worktree_tree() {  # repo
-    cp "$(git -C "$1" rev-parse --absolute-git-dir)/index" "$INDEX"
-    GIT_INDEX_FILE="$INDEX" git -C "$1" add -u
-    GIT_INDEX_FILE="$INDEX" git -C "$1" write-tree
-}
-pin() { sed -n "s/^$1=//p" "$ROOT/tools/fetch_zettabridge.sh"; }
+# The upstream commit upstream/README.md names for ZettaBridge or Dynarmic.
+upstream_commit() { sed -n "s/^$1  *\([0-9a-f]\{40\}\)  .*/\1/p" "$ROOT/upstream/README.md"; }
 
 step "host tools and inputs"
 for tool in git curl unzip sha256sum cmake ninja python3; do
@@ -78,43 +58,22 @@ done
 [ -f "$GAME_APK" ] || die "missing game APK: $GAME_APK (copy minecraft-1.1.5.apk into game/)"
 echo "game APK: $GAME_APK"
 
+step "sources"
+# What gets built must be a commit, or the release could not be rebuilt later. Ignored files
+# (build output, the sysroot, game/) do not count.
+CHANGES=$(git -C "$ROOT" status --porcelain)
+if [ -n "$CHANGES" ]; then
+    printf '%s\n' "$CHANGES" >&2
+    die "uncommitted changes (above): commit them first, or use tools/build_apk.sh for a test build"
+fi
+SOURCE_COMMIT=$(git -C "$ROOT" rev-parse HEAD)
+ZETTA_COMMIT=$(upstream_commit ZettaBridge)
+DYNARMIC_COMMIT=$(upstream_commit Dynarmic)
+[ -n "$ZETTA_COMMIT" ] && [ -n "$DYNARMIC_COMMIT" ] || die "upstream/README.md does not name the upstream commits"
+echo "commit $SOURCE_COMMIT"
+
 step "toolchain"
 sh "$ROOT/tools/setup_toolchain_windows.sh"
-
-step "ZettaBridge sources"
-if [ ! -d "$ZB" ]; then
-    sh "$ROOT/tools/fetch_zettabridge.sh"
-fi
-ZETTA_COMMIT=$(pin ZETTA_COMMIT)
-DYNARMIC_COMMIT=$(pin DYNARMIC_COMMIT)
-[ "$(git -C "$ZB" rev-parse HEAD)" = "$ZETTA_COMMIT" ] ||
-    die "upstream/ZettaBridge is not on the pinned commit $ZETTA_COMMIT"
-[ "$(git -C "$ZB/third_party/dynarmic" rev-parse HEAD)" = "$DYNARMIC_COMMIT" ] ||
-    die "third_party/dynarmic is not on the pinned commit $DYNARMIC_COMMIT"
-# What gets built must be what patches/ records, or the release cannot be rebuilt later.
-expected=$(patched_tree "$ZB/third_party/dynarmic" "$ZB"/third_party/patches/dynarmic-*.patch \
-    "$ROOT"/patches/dynarmic/*.patch)
-actual=$(worktree_tree "$ZB/third_party/dynarmic")
-if [ "$expected" != "$actual" ]; then
-    git -C "$ZB/third_party/dynarmic" diff-tree -r --stat "$expected" "$actual" >&2
-    die "third_party/dynarmic differs from ZettaBridge's Dynarmic patches plus patches/dynarmic
-(above: patches -> checkout). Save this project's part as patches/dynarmic/*.patch: the diff of the
-checkout against the pinned commit with ZettaBridge's third_party/patches applied."
-fi
-expected=$(patched_tree "$ZB" "$ROOT"/patches/zettabridge/*.patch)
-actual=$(worktree_tree "$ZB")
-if [ "$expected" != "$actual" ]; then
-    git -C "$ZB" diff-tree -r --stat "$expected" "$actual" >&2
-    die "upstream/ZettaBridge differs from patches/zettabridge (above: patch -> checkout). Save the
-checkout into the patch (git add -N any new file first), then run this again:
-  cd upstream/ZettaBridge && git diff --binary -- . ':(exclude)third_party/dynarmic' > ../../patches/zettabridge/0001-mcpe-arm64.patch"
-fi
-untracked=$(git -C "$ZB" ls-files --others --exclude-standard)
-if [ -n "$untracked" ]; then
-    echo "note: untracked, so not in patches/ (git add -N to include):"
-    printf '%s\n' "$untracked" | sed 's/^/  /'
-fi
-echo "ZettaBridge $ZETTA_COMMIT + patches/zettabridge: matches the checkout"
 
 step "arm32 sysroot"
 if [ -s "$ZB/sysroot/system/bin/linker" ] && [ -s "$ZB/sysroot/system/lib/libstdc++.so" ]; then
@@ -189,14 +148,9 @@ cp "$APK" "$DEST/$NAME"
     echo "built          $(date -u '+%Y-%m-%d %H:%M UTC')"
     echo
     echo "game           $(printf '%s\n' "$GAME_INFO" | sed -n 's/^package=//p'), sha256 $(printf '%s\n' "$GAME_INFO" | sed -n 's/^sha256=//p')"
-    echo "ZettaBridge    $ZETTA_COMMIT"
-    for patch in "$ROOT"/patches/zettabridge/*.patch; do
-        echo "  + $(basename "$patch") sha256 $(sha256sum "$patch" | cut -d' ' -f1)"
-    done
-    echo "Dynarmic       $DYNARMIC_COMMIT + ZettaBridge's third_party/patches"
-    for patch in "$ROOT"/patches/dynarmic/*.patch; do
-        echo "  + $(basename "$patch") sha256 $(sha256sum "$patch" | cut -d' ' -f1)"
-    done
+    echo "source         commit $SOURCE_COMMIT of this repository"
+    echo "ZettaBridge    $ZETTA_COMMIT + this project's changes (upstream/)"
+    echo "Dynarmic       $DYNARMIC_COMMIT + ZettaBridge's third_party/patches + this project's changes"
     echo "NDK            $NDK_VERSION"
     echo "Boost headers  $BOOST_VERSION"
     echo

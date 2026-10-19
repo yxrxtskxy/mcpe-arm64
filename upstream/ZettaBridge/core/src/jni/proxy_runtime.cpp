@@ -1,6 +1,7 @@
 #include "zb/proxy_runtime.h"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <climits>
@@ -10,10 +11,12 @@
 #include <string_view>
 #include <vector>
 
+#include "zb/gl_hostcalls.h"
 #include "zb/hang_watchdog.h"
 #include "zb/host_jni.h"
 #include "zb/library_protocol.h"
 #include "zb/log.h"
+#include "zb/native_activity_hostcalls.h"
 #include "zb/runtime_report.h"
 
 namespace zb {
@@ -193,6 +196,19 @@ bool ProxyRuntime::activate_plugin(JniBackend::Env env, const std::string& plugi
         // opens something beside "its own" library finds the real thing (IL2CPP does exactly
         // this and otherwise reports that it cannot load).
         engine_.add_path_alias(root + "/proxy/", root + "/lib/");
+        // Old apps build their private storage path by hand, "/data/data/<package>/...":
+        // Minecraft PE keeps games/com.mojang (worlds, options) there. For a plugin that names a
+        // directory of another app, which cannot be written and may well exist (the original
+        // game installed next to us), so it is the plugin's own data directory instead, which is
+        // exactly what that path means for an installed app.
+        const std::string package = root.substr(root.find_last_of('/') + 1);
+        if (!package.empty()) {
+            engine_.add_path_alias("/data/data/" + package, root + "/data");
+            // The pre-N native library directory, which the longest-prefix rule keeps apart.
+            engine_.add_path_alias("/data/data/" + package + "/lib", root + "/lib");
+            engine_.add_path_alias("/data/user/" + std::to_string(::getuid() / 100000) + "/" + package,
+                                   root + "/data");
+        }
         target_sdk_ = target_sdk;
         options_ = std::move(options);
         log("guest JNI runtime: plugin %s activated (targetSdk %u)", root.c_str(), target_sdk);
@@ -453,13 +469,14 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
     HostInput* host_input = host_input_;
     HostConfiguration* host_configuration = host_configuration_;
     HostPlatformCompat* host_compat = host_compat_;
+    GuestJniEngine* engine = this;
     // Core ranges never overlap (GLES 0-141, assets 142-159, windows 160-167, EGL 168-211,
-    // append-only platform compatibility 212-227, sensors 344-375, JNI 0xFB00+), so the chain
-    // order is free;
+    // append-only platform compatibility 212-227, sensors 344-375, ANativeActivity_* 579-583,
+    // JNI 0xFB00+), so the chain order is free;
     // GL stays first because it is by far the hotter path during rendering.
     runtime_->set_host_call_handler([host_jni, host_gl, host_assets, host_windows, host_egl,
                                      host_looper, host_sensors, host_input, host_configuration,
-                                     host_compat](std::uint32_t index, GuestThread& thread) {
+                                     host_compat, engine](std::uint32_t index, GuestThread& thread) {
         if (host_gl != nullptr && host_gl->handle_host_call(index, thread)) return true;
         if (host_assets != nullptr && host_assets->handle_host_call(index, thread)) return true;
         if (host_windows != nullptr && host_windows->handle_host_call(index, thread)) return true;
@@ -468,9 +485,54 @@ GuestJniEngine::GuestJniEngine(JniBackend& backend, GlBackend* gl_backend, HostG
         if (host_sensors->handle_host_call(index, thread)) return true;
         if (host_input != nullptr && host_input->handle_host_call(index, thread)) return true;
         if (host_configuration != nullptr && host_configuration->handle_host_call(index, thread)) return true;
+        if (index >= ZB_NATIVE_ACTIVITY_HC_FIRST && index <= ZB_NATIVE_ACTIVITY_HC_LAST) {
+            engine->serve_native_activity_call(index, thread);
+            return true;
+        }
         if (host_compat->handle_host_call(index, thread)) return true;
         return host_jni->handle_host_call(index, thread);
     });
+    // GL calls are thousands per frame; all but the few that run guest code are served without
+    // leaving translated code.
+    if (host_gl != nullptr) {
+        std::vector<std::uint32_t> inline_calls;
+        for (const GlHostCallInfo& call : kGlHostCalls) {
+            if (!HostGl::reenters_guest(call.index)) inline_calls.push_back(call.index);
+        }
+        runtime_->set_inline_host_calls(std::move(inline_calls));
+    }
+}
+
+void GuestJniEngine::serve_native_activity_call(std::uint32_t index, GuestThread& thread) {
+    struct Entry {
+        std::uint32_t index;
+        NativeActivityPlatform::Request request;
+        const char* name;
+    };
+    static constexpr Entry kEntries[] = {
+        {ZB_NATIVE_ACTIVITY_HC_finish, NativeActivityPlatform::Request::Finish, "ANativeActivity_finish"},
+        {ZB_NATIVE_ACTIVITY_HC_hideSoftInput, NativeActivityPlatform::Request::HideSoftInput,
+         "ANativeActivity_hideSoftInput"},
+        {ZB_NATIVE_ACTIVITY_HC_setWindowFlags, NativeActivityPlatform::Request::SetWindowFlags,
+         "ANativeActivity_setWindowFlags"},
+        {ZB_NATIVE_ACTIVITY_HC_setWindowFormat, NativeActivityPlatform::Request::SetWindowFormat,
+         "ANativeActivity_setWindowFormat"},
+        {ZB_NATIVE_ACTIVITY_HC_showSoftInput, NativeActivityPlatform::Request::ShowSoftInput,
+         "ANativeActivity_showSoftInput"},
+    };
+    auto& regs = thread.regs();
+    // Every helper returns void, so r0 is cleared whatever happens.
+    const std::uint32_t guest_activity = regs[0];
+    const std::uint32_t first = regs[1];
+    const std::uint32_t second = regs[2];
+    regs[0] = 0;
+    for (const Entry& entry : kEntries) {
+        if (entry.index != index) continue;
+        NativeActivityPlatform* platform = native_activity_platform_;
+        if (platform != nullptr && platform->request(guest_activity, entry.request, first, second)) return;
+        runtime_report().note_unimplemented_host_call(index, "libandroid.so", entry.name);
+        return;
+    }
 }
 
 GuestJniEngine::~GuestJniEngine() {

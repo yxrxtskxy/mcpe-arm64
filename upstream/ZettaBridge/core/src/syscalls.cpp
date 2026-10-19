@@ -4,6 +4,12 @@
 #include <linux/futex.h>
 #include <sched.h>
 #include <sys/ioctl.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -28,12 +34,14 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -101,15 +109,40 @@ bool has_deliverable_signal(GuestThread& thread) {
     return thread.has_pending_signals(thread.sigmask);
 }
 
-// ZB_STRACE=1 logs every guest syscall with its first four arguments and result.
+// ZB_STRACE=1 logs every guest syscall with its first four arguments and result. Inside an app
+// the environment cannot be set from outside, so on Android the system property debug.zb.strace
+// does the same: "all" (or "1") for everything, "net" for the socket calls only, which is what a
+// stalled network handshake needs without drowning logcat in futex calls. Read once.
+enum TraceMask : unsigned { kTraceNone = 0, kTraceNet = 1, kTraceAll = 3 };
+
+unsigned trace_mask() {
+    static const unsigned mask = [] {
+        const char* env = std::getenv("ZB_STRACE");
+        std::string value = env != nullptr ? env : "";
+#ifdef __ANDROID__
+        if (value.empty()) {
+            char property[PROP_VALUE_MAX] = {};
+            if (__system_property_get("debug.zb.strace", property) > 0) value = property;
+        }
+#endif
+        if (value.empty() || value == "0") return static_cast<unsigned>(kTraceNone);
+        if (value == "net") return static_cast<unsigned>(kTraceNet);
+        return static_cast<unsigned>(kTraceAll);
+    }();
+    return mask;
+}
+
 bool trace_enabled() {
-    static const bool enabled = std::getenv("ZB_STRACE") != nullptr;
-    return enabled;
+    return trace_mask() == kTraceAll;
 }
 
 std::int32_t result_of(long host_ret) {
     return host_ret == -1 ? -errno : static_cast<std::int32_t>(host_ret);
 }
+
+// Defined below the guest-memory helpers it uses.
+struct Ctx;
+void note_failed_file_call(Ctx& c, std::uint32_t nr, std::int32_t res);
 
 template <typename T>
 bool read_guest(GuestMemory& m, std::uint32_t addr, T& out) {
@@ -291,6 +324,12 @@ std::int32_t sys_mmap2(Ctx& c) {
         if (at == 0) return -ENOMEM;
     }
 
+    // Translations can only exist where something was executable before this call (a MAP_FIXED
+    // over code). Invalidating every other range halted every guest thread's JIT for nothing,
+    // and allocators map and unmap large buffers constantly: Minecraft PE's asset loading spent
+    // its time re-entering translated code instead of running it.
+    const bool had_code = c.mem.any_executable(at, size);
+
     // Code of libraries marked DT_ZB_TEXTREL stays writable so the linker can relocate it.
     const bool textrel = !(flags & MAP_ANONYMOUS) && (prot & PROT_EXEC) && elf_has_textrel_marker(fd);
     const int effective_prot = textrel ? (prot | PROT_WRITE) : prot;
@@ -310,7 +349,7 @@ std::int32_t sys_mmap2(Ctx& c) {
                                    n > 0 ? std::string(target, static_cast<std::size_t>(n)) : std::string("fd"));
         if (textrel) c.proc.add_textrel_range(at, static_cast<std::uint32_t>(size));
     }
-    c.proc.invalidate(at, static_cast<std::uint32_t>(size));
+    if (had_code) c.proc.invalidate(at, static_cast<std::uint32_t>(size));
     return static_cast<std::int32_t>(at);
 }
 
@@ -348,9 +387,10 @@ std::int32_t sys_mremap(Ctx& c) {
         if (new_size < old_size) {
             const std::uint32_t tail = old_addr + static_cast<std::uint32_t>(new_size);
             const std::uint64_t cut = old_size - new_size;
+            const bool had_code = c.mem.any_executable(tail, cut);
             if (!c.mem.unmap(tail, cut)) return -EINVAL;
             c.proc.forget_mappings(tail, cut);
-            c.proc.invalidate(tail, static_cast<std::uint32_t>(cut));
+            if (had_code) c.proc.invalidate(tail, static_cast<std::uint32_t>(cut));
         }
         return static_cast<std::int32_t>(old_addr);
     }
@@ -387,10 +427,11 @@ std::int32_t sys_mremap(Ctx& c) {
         c.mem.unmap(at, new_size);
         return -EACCES;
     }
+    // The new range was free, so it holds no translations; the old one only if it was code.
+    const bool had_code = c.mem.any_executable(old_addr, old_size);
     if (!c.mem.unmap(old_addr, old_size)) return -EINVAL;
     c.proc.forget_mappings(old_addr, old_size);
-    c.proc.invalidate(old_addr, static_cast<std::uint32_t>(old_size));
-    c.proc.invalidate(at, static_cast<std::uint32_t>(new_size));
+    if (had_code) c.proc.invalidate(old_addr, static_cast<std::uint32_t>(old_size));
     return static_cast<std::int32_t>(at);
 }
 
@@ -399,9 +440,10 @@ std::int32_t sys_munmap(Ctx& c) {
     if ((addr & kPageMask) || c.a[1] == 0) return -EINVAL;
     const std::uint64_t size = page_round_up(c.a[1]);
     if (static_cast<std::uint64_t>(addr) + size > kGuestSpaceSize) return -EINVAL;
+    const bool had_code = c.mem.any_executable(addr, size);  // see sys_mmap2
     if (!c.mem.unmap(addr, size)) return -EINVAL;
     c.proc.forget_mappings(addr, size);
-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+    if (had_code) c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
     return 0;
 }
 
@@ -413,8 +455,11 @@ std::int32_t sys_mprotect(Ctx& c) {
     if (!c.mem.accessible(addr, size, 0)) return -ENOMEM;
     int prot = static_cast<int>(c.a[2]);
     if ((prot & PROT_EXEC) && c.proc.overlaps_textrel_range(addr, size)) prot |= PROT_WRITE;
+    // Only a range that was executable can hold translations. One becoming executable needs
+    // nothing: whatever was translated there before was dropped when it stopped being so.
+    const bool had_code = c.mem.any_executable(addr, size);
     if (!c.mem.protect(addr, size, prot)) return -EACCES;
-    c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
+    if (had_code) c.proc.invalidate(addr, static_cast<std::uint32_t>(size));
     return 0;
 }
 
@@ -424,7 +469,15 @@ std::int32_t sys_madvise(Ctx& c) {
     if (c.a[1] == 0) return 0;
     const std::uint64_t size = page_round_up(c.a[1]);
     if (!c.mem.accessible(addr, size, 0)) return -ENOMEM;
-    return result_of(::madvise(c.mem.base() + addr, size, static_cast<int>(c.a[2])));
+    const int advice = static_cast<int>(c.a[2]);
+    const std::int32_t result = result_of(::madvise(c.mem.base() + addr, size, advice));
+    // bionic's arc4random aborts when MADV_WIPEONFORK fails, and kernels before 4.14 (WSL1's
+    // emulated 4.4 among them) reject it with EINVAL. Fork is refused for the guest anyway, so
+    // the wipe-on-fork hint (and its undo) has nothing to act on and can safely report success.
+    constexpr int kMadvWipeOnFork = 18;
+    constexpr int kMadvKeepOnFork = 19;
+    if (result == -EINVAL && (advice == kMadvWipeOnFork || advice == kMadvKeepOnFork)) return 0;
+    return result;
 }
 
 std::int32_t sys_rt_sigaction(Ctx& c) {
@@ -617,8 +670,75 @@ std::int32_t sys_statx(Ctx& c) {
     return result_of(::syscall(SYS_statx, static_cast<int>(c.a[0]), host_path.c_str(), static_cast<int>(c.a[2]), c.a[3], buf));
 }
 
+// Network interface ioctls. The arm32 struct ifreq is 32 bytes (name[16] + a 16-byte union) and
+// the arm64 one 40 (the union holds an 8-byte pointer and the larger struct ifmap). Every request
+// below uses only the name and the first 16 bytes of the union (a sockaddr, flags, an index, the
+// MTU), which sit at the same offsets in both, so the guest's 32 bytes are the start of the host
+// structure. bionic's getifaddrs() falls back to SIOCGIFNAME when netlink RTM_GETLINK is refused
+// (apps targeting SDK 30+), and RakNet enumerates the interfaces through it.
+constexpr std::uint32_t kGuestIfreqSize = 32;
+
+bool is_single_ifreq_ioctl(unsigned long request) {
+    switch (request) {
+    case SIOCGIFNAME:
+    case SIOCGIFFLAGS:
+    case SIOCGIFADDR:
+    case SIOCGIFDSTADDR:
+    case SIOCGIFBRDADDR:
+    case SIOCGIFNETMASK:
+    case SIOCGIFMTU:
+    case SIOCGIFHWADDR:
+    case SIOCGIFINDEX:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::int32_t sys_ioctl_ifreq(Ctx& c, unsigned long request) {
+    std::uint8_t* guest = c.mem.host_ptr(c.a[2], kGuestIfreqSize, kPageRead | kPageWrite);
+    if (!guest) return -EFAULT;
+    struct ifreq host {};
+    static_assert(sizeof(host) >= kGuestIfreqSize);
+    std::memcpy(&host, guest, kGuestIfreqSize);
+    const int rc = ::ioctl(static_cast<int>(c.a[0]), request, &host);
+    if (rc == -1) return -errno;
+    std::memcpy(guest, &host, kGuestIfreqSize);
+    return rc;
+}
+
+// SIOCGIFCONF: struct ifconf is {int len; pointer} (8 bytes for the guest), and the buffer is an
+// array of struct ifreq, so the entries are converted one by one and the length counts guest
+// entries.
+std::int32_t sys_ioctl_ifconf(Ctx& c) {
+    std::uint8_t* conf = c.mem.host_ptr(c.a[2], 8, kPageRead | kPageWrite);
+    if (!conf) return -EFAULT;
+    std::int32_t guest_len;
+    std::uint32_t guest_buf;
+    std::memcpy(&guest_len, conf, 4);
+    std::memcpy(&guest_buf, conf + 4, 4);
+    if (guest_len < 0) return -EINVAL;
+    const std::size_t capacity = guest_buf == 0 ? 0 : static_cast<std::size_t>(guest_len) / kGuestIfreqSize;
+    std::vector<struct ifreq> entries(capacity);
+    struct ifconf host {};
+    host.ifc_len = static_cast<int>(capacity * sizeof(struct ifreq));
+    host.ifc_req = capacity != 0 ? entries.data() : nullptr;
+    if (::ioctl(static_cast<int>(c.a[0]), SIOCGIFCONF, &host) == -1) return -errno;
+    const std::size_t count = static_cast<std::size_t>(host.ifc_len) / sizeof(struct ifreq);
+    if (capacity != 0) {
+        std::uint8_t* out = c.mem.host_ptr(guest_buf, static_cast<std::uint32_t>(count * kGuestIfreqSize), kPageWrite);
+        if (!out && count != 0) return -EFAULT;
+        for (std::size_t i = 0; i < count; ++i) std::memcpy(out + i * kGuestIfreqSize, &entries[i], kGuestIfreqSize);
+    }
+    const std::int32_t out_len = static_cast<std::int32_t>(count * kGuestIfreqSize);
+    std::memcpy(conf, &out_len, 4);
+    return 0;
+}
+
 std::int32_t sys_ioctl(Ctx& c) {
     const unsigned long request = c.a[1];
+    if (is_single_ifreq_ioctl(request)) return sys_ioctl_ifreq(c, request);
+    if (request == SIOCGIFCONF) return sys_ioctl_ifconf(c);
     std::uint32_t arg_size = 0;
     std::uint8_t need = kPageRead | kPageWrite;
     switch (request) {
@@ -635,6 +755,104 @@ std::int32_t sys_ioctl(Ctx& c) {
     return result_of(::ioctl(static_cast<int>(c.a[0]), request, arg));
 }
 
+// Record locks. The guest has two layouts and the host one: arm32 struct flock carries 32-bit
+// offsets (F_GETLK/F_SETLK/F_SETLKW = 5/6/7), the EABI struct flock64 64-bit ones, 8-byte aligned
+// (F_GETLK64/F_SETLK64/F_SETLKW64 = 12/13/14, and the open-file-description locks 36-38). The
+// arm64 kernel knows only its own struct flock, which matches neither, so every lock is copied
+// across. LevelDB (Minecraft PE's world storage) takes its LOCK file with F_SETLK and treats the
+// failure as "the database cannot be opened".
+namespace guest_lock {
+struct Flock32 {
+    std::int16_t l_type;
+    std::int16_t l_whence;
+    std::int32_t l_start;
+    std::int32_t l_len;
+    std::int32_t l_pid;
+};
+static_assert(sizeof(Flock32) == 16);
+struct Flock64 {
+    std::int16_t l_type;
+    std::int16_t l_whence;
+    std::int32_t pad;
+    std::int64_t l_start;
+    std::int64_t l_len;
+    std::int32_t l_pid;
+    std::int32_t pad2;
+};
+static_assert(sizeof(Flock64) == 32 && offsetof(Flock64, l_start) == 8 && offsetof(Flock64, l_pid) == 24);
+
+constexpr int kGetLk = 5, kSetLk = 6, kSetLkW = 7;
+constexpr int kGetLk64 = 12, kSetLk64 = 13, kSetLkW64 = 14;
+constexpr int kOfdGetLk = 36, kOfdSetLk = 37, kOfdSetLkW = 38;
+}  // namespace guest_lock
+
+std::int32_t sys_fcntl_lock(Ctx& c, int guest_cmd) {
+    using namespace guest_lock;
+    const int fd = static_cast<int>(c.a[0]);
+    const bool wide = guest_cmd >= kGetLk64;  // the 64-bit and OFD commands use struct flock64
+    int host_cmd = F_GETLK;
+    switch (guest_cmd) {
+    case kGetLk: case kGetLk64: host_cmd = F_GETLK; break;
+    case kSetLk: case kSetLk64: host_cmd = F_SETLK; break;
+    case kSetLkW: case kSetLkW64: host_cmd = F_SETLKW; break;
+    case kOfdGetLk: host_cmd = F_OFD_GETLK; break;
+    case kOfdSetLk: host_cmd = F_OFD_SETLK; break;
+    case kOfdSetLkW: host_cmd = F_OFD_SETLKW; break;
+    default: return -EINVAL;
+    }
+
+    struct flock host {};
+    if (wide) {
+        Flock64 g;
+        if (!read_guest(c.mem, c.a[2], g)) return -EFAULT;
+        host.l_type = g.l_type;
+        host.l_whence = g.l_whence;
+        host.l_start = static_cast<off_t>(g.l_start);
+        host.l_len = static_cast<off_t>(g.l_len);
+        host.l_pid = g.l_pid;
+    } else {
+        Flock32 g;
+        if (!read_guest(c.mem, c.a[2], g)) return -EFAULT;
+        host.l_type = g.l_type;
+        host.l_whence = g.l_whence;
+        host.l_start = g.l_start;
+        host.l_len = g.l_len;
+        host.l_pid = g.l_pid;
+    }
+
+    int rc;
+    if (host_cmd == F_SETLKW || host_cmd == F_OFD_SETLKW) {
+        BlockingSection blocking(c.thread);  // a guest signal must be able to break the wait
+        rc = ::fcntl(fd, host_cmd, &host);
+    } else {
+        rc = ::fcntl(fd, host_cmd, &host);
+    }
+    if (rc == -1) return -errno;
+
+    if (host_cmd == F_GETLK || host_cmd == F_OFD_GETLK) {
+        if (wide) {
+            Flock64 g{};
+            g.l_type = static_cast<std::int16_t>(host.l_type);
+            g.l_whence = static_cast<std::int16_t>(host.l_whence);
+            g.l_start = host.l_start;
+            g.l_len = host.l_len;
+            g.l_pid = host.l_pid;
+            if (!write_guest(c.mem, c.a[2], g)) return -EFAULT;
+        } else {
+            // The kernel's own compat path answers a lock it cannot describe in 32 bits so.
+            if (host.l_start > INT32_MAX || host.l_len > INT32_MAX) return -EOVERFLOW;
+            Flock32 g{};
+            g.l_type = static_cast<std::int16_t>(host.l_type);
+            g.l_whence = static_cast<std::int16_t>(host.l_whence);
+            g.l_start = static_cast<std::int32_t>(host.l_start);
+            g.l_len = static_cast<std::int32_t>(host.l_len);
+            g.l_pid = host.l_pid;
+            if (!write_guest(c.mem, c.a[2], g)) return -EFAULT;
+        }
+    }
+    return rc;
+}
+
 std::int32_t sys_fcntl64(Ctx& c) {
     const int cmd = static_cast<int>(c.a[1]);
     switch (cmd) {
@@ -644,7 +862,26 @@ std::int32_t sys_fcntl64(Ctx& c) {
     case F_GETFL:
     case F_SETFL:
     case F_DUPFD_CLOEXEC:
+    // Plain integer commands, numbered the same for arm32 and arm64.
+    case F_SETOWN:
+    case F_GETOWN:
+    case F_SETSIG:
+    case F_GETSIG:
+    case F_SETPIPE_SZ:
+    case F_GETPIPE_SZ:
+    case F_ADD_SEALS:
+    case F_GET_SEALS:
         return result_of(::fcntl(static_cast<int>(c.a[0]), cmd, static_cast<long>(c.a[2])));
+    case guest_lock::kGetLk:
+    case guest_lock::kSetLk:
+    case guest_lock::kSetLkW:
+    case guest_lock::kGetLk64:
+    case guest_lock::kSetLk64:
+    case guest_lock::kSetLkW64:
+    case guest_lock::kOfdGetLk:
+    case guest_lock::kOfdSetLk:
+    case guest_lock::kOfdSetLkW:
+        return sys_fcntl_lock(c, cmd);
     default:
         if (c.proc.first_time(kSeenFcntl | static_cast<std::uint32_t>(cmd))) log("unsupported fcntl command %d", cmd);
         return -EINVAL;
@@ -752,6 +989,140 @@ std::int32_t sys_pipe2(Ctx& c) {
     if (::pipe2(fds, static_cast<int>(c.a[1])) != 0) return -errno;
     std::memcpy(out, fds, sizeof fds);
     return 0;
+}
+
+// Failed file syscalls, with the path: a guest whose storage setup fails (Minecraft PE's LevelDB
+// world database) usually says nothing and crashes later on the null it got back. ENOENT from a
+// lookup is how programs probe for files and EEXIST from mkdir is mkdir -p, so those are left
+// out; everything else is logged once per (syscall, error, path), up to a fixed number of lines.
+void note_failed_file_call(Ctx& c, std::uint32_t nr, std::int32_t res) {
+    int path_arg = -1;
+    bool probe = false;  // ENOENT is a normal answer
+    switch (nr) {
+    case NR_openat: path_arg = 1; probe = (c.a[2] & O_CREAT) == 0; break;
+    case NR_faccessat:
+    case NR_fstatat64:
+    case NR_statx: path_arg = 1; probe = true; break;
+    case NR_statfs64:
+    case NR_truncate64: path_arg = 0; probe = nr == NR_statfs64; break;
+    case NR_mkdirat:
+    case NR_unlinkat:
+    case NR_renameat:
+    case NR_renameat2:
+    case NR_linkat:
+    case NR_utimensat:
+    case NR_fchmodat: path_arg = 1; break;
+    case NR_symlinkat: path_arg = 2; break;
+    case NR_fcntl64:
+    case NR_flock: break;
+    // Sockets: a failure the guest does not expect (a loopback connection that never comes up)
+    // stalls it as silently as a storage failure crashes it. Would-block results are normal.
+    case NR_socket:
+    case NR_bind:
+    case NR_connect:
+    case NR_listen:
+    case NR_sendto:
+    case NR_recvfrom:
+    case NR_sendmsg:
+    case NR_recvmsg:
+    case NR_setsockopt:
+    case NR_getsockopt:
+    case NR_getsockname:
+    case NR_ioctl:
+        if (res == -EAGAIN || res == -EINPROGRESS || res == -EINTR) return;
+        break;
+    default: return;
+    }
+    if (probe && res == -ENOENT) return;
+    if (nr == NR_mkdirat && res == -EEXIST) return;
+    if (nr == NR_unlinkat && res == -ENOENT) return;
+
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    constexpr std::size_t kMaxLines = 100;
+    std::string key = std::to_string(nr) + ":" + std::to_string(res) + ":";
+    const char* path = nullptr;
+    if (path_arg >= 0) {
+        path = guest_cstr(c.mem, c.a[path_arg]);
+        key += path != nullptr ? path : "?";
+    } else {
+        key += std::to_string(c.a[1]);  // fcntl/flock: the command
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (seen.size() >= kMaxLines || !seen.insert(key).second) return;
+    }
+    if (path_arg >= 0) {
+        log("file syscall %s(\"%s\") failed: %s", syscall_name(nr), path != nullptr ? path : "?",
+            std::strerror(-res));
+    } else {
+        log("syscall %s(%d, 0x%x, 0x%x) failed: %s", syscall_name(nr), static_cast<int>(c.a[0]), c.a[1], c.a[2],
+            std::strerror(-res));
+    }
+}
+
+// "inet 127.0.0.1:19132" for a guest sockaddr, "" when there is none.
+std::string describe_guest_sockaddr(GuestMemory& mem, std::uint32_t addr, std::uint32_t len) {
+    if (addr == 0 || len < 2) return {};
+    const std::uint8_t* p = mem.host_ptr(addr, len < 28 ? len : 28, kPageRead);
+    if (p == nullptr) return "?";
+    std::uint16_t family;
+    std::memcpy(&family, p, 2);
+    char text[96];
+    if (family == AF_INET && len >= sizeof(sockaddr_in)) {
+        sockaddr_in in;
+        std::memcpy(&in, p, sizeof in);
+        char ip[INET_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET, &in.sin_addr, ip, sizeof ip);
+        std::snprintf(text, sizeof text, "inet %s:%u", ip, ntohs(in.sin_port));
+    } else if (family == AF_INET6 && len >= sizeof(sockaddr_in6)) {
+        sockaddr_in6 in6;
+        std::memcpy(&in6, p, sizeof in6);
+        char ip[INET6_ADDRSTRLEN] = {};
+        ::inet_ntop(AF_INET6, &in6.sin6_addr, ip, sizeof ip);
+        std::snprintf(text, sizeof text, "inet6 [%s]:%u", ip, ntohs(in6.sin6_port));
+    } else {
+        std::snprintf(text, sizeof text, "family %u", family);
+    }
+    return text;
+}
+
+// debug.zb.strace=net: every socket-related call with its result.
+void trace_net_call(Ctx& c, std::uint32_t nr, std::int32_t res) {
+    std::string where;
+    switch (nr) {
+    case NR_bind:
+    case NR_connect: where = describe_guest_sockaddr(c.mem, c.a[1], c.a[2]); break;
+    case NR_sendto: where = describe_guest_sockaddr(c.mem, c.a[4], c.a[5]); break;
+    case NR_recvfrom: {
+        std::uint32_t len = 0;
+        if (const std::uint8_t* p = c.a[5] != 0 ? c.mem.host_ptr(c.a[5], 4, kPageRead) : nullptr) std::memcpy(&len, p, 4);
+        if (res >= 0) where = describe_guest_sockaddr(c.mem, c.a[4], len);
+        break;
+    }
+    case NR_socket:
+    case NR_listen:
+    case NR_accept:
+    case NR_accept4:
+    case NR_sendmsg:
+    case NR_recvmsg:
+    case NR_sendmmsg:
+    case NR_recvmmsg:
+    case NR_setsockopt:
+    case NR_getsockopt:
+    case NR_getsockname:
+    case NR_getpeername:
+    case NR_shutdown:
+    case NR_poll:
+    case NR_ppoll:
+    case NR__newselect:
+    case NR_pselect6:
+        break;
+    default:
+        return;
+    }
+    log("net %s(%d, 0x%x, 0x%x) = %d%s%s", syscall_name(nr), static_cast<int>(c.a[0]), c.a[1], c.a[2], res,
+        where.empty() ? "" : " ", where.c_str());
 }
 
 std::int32_t sys_path_call(Ctx& c, std::uint32_t path_arg, long (*call)(Ctx&, const char*)) {
@@ -1190,7 +1561,7 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     const auto guest_tid = [&] {
         return thread.tid != 0 ? thread.tid : static_cast<std::int32_t>(::syscall(SYS_gettid));
     };
-    record_thread_activity(guest_tid(), ThreadActivityKind::kSyscall, nr);
+    record_thread_activity(guest_tid(), ThreadActivityKind::kSyscall, nr, regs[14], regs[13]);
     // Marks the syscall finished on every exit path, so a thread sitting inside one (a blocking
     // futex, a poll) reads differently from a thread that merely stopped calling out.
     struct ActivityDone {
@@ -1709,6 +2080,8 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
     if (trace_enabled()) {
         log("%s(0x%x, 0x%x, 0x%x, 0x%x) = %d", syscall_name(nr), c.a[0], c.a[1], c.a[2], c.a[3], res);
     }
+    if (res < 0) note_failed_file_call(c, nr, res);
+    if (trace_mask() == kTraceNet) trace_net_call(c, nr, res);
     if (c.stop) return false;
     // The pc of the svc itself: the stop recorded the instruction after it, and Thumb svc is two
     // bytes where ARM is four.

@@ -53,6 +53,9 @@ public:
 
     // True if every page touched by [addr, addr + len) is mapped with all `need` flags.
     bool accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const;
+    // True if any page of the range is mapped executable. Translated code only ever comes from
+    // such pages, so a mapping change elsewhere cannot leave a stale translation behind.
+    bool any_executable(std::uint32_t addr, std::uint64_t len) const;
     // Host pointer to [addr, addr + len) if accessible, else nullptr.
     std::uint8_t* host_ptr(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const;
     std::uint8_t page_flags(std::uint32_t addr) const { return pages_[addr >> 12]; }

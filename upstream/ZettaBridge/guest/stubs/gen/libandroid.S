@@ -1474,3 +1474,43 @@ ALooper_pollAll:
     svc #0x5a01eb
     bx lr
 .size ALooper_pollAll, . - ALooper_pollAll
+
+.global ANativeActivity_finish
+.type ANativeActivity_finish, %function
+.p2align 2
+ANativeActivity_finish:
+    svc #0x5a0243
+    bx lr
+.size ANativeActivity_finish, . - ANativeActivity_finish
+
+.global ANativeActivity_hideSoftInput
+.type ANativeActivity_hideSoftInput, %function
+.p2align 2
+ANativeActivity_hideSoftInput:
+    svc #0x5a0244
+    bx lr
+.size ANativeActivity_hideSoftInput, . - ANativeActivity_hideSoftInput
+
+.global ANativeActivity_setWindowFlags
+.type ANativeActivity_setWindowFlags, %function
+.p2align 2
+ANativeActivity_setWindowFlags:
+    svc #0x5a0245
+    bx lr
+.size ANativeActivity_setWindowFlags, . - ANativeActivity_setWindowFlags
+
+.global ANativeActivity_setWindowFormat
+.type ANativeActivity_setWindowFormat, %function
+.p2align 2
+ANativeActivity_setWindowFormat:
+    svc #0x5a0246
+    bx lr
+.size ANativeActivity_setWindowFormat, . - ANativeActivity_setWindowFormat
+
+.global ANativeActivity_showSoftInput
+.type ANativeActivity_showSoftInput, %function
+.p2align 2
+ANativeActivity_showSoftInput:
+    svc #0x5a0247
+    bx lr
+.size ANativeActivity_showSoftInput, . - ANativeActivity_showSoftInput

@@ -1,7 +1,10 @@
 // Process host-call dispatch, plus borrowed JITs: a borrower created from a guest thread parked
 // in a host call inherits its identity and emulated state, receives tid-directed signals, and
 // hands its signal mask, alternate stack and pending signals back when destroyed.
-// Usage: host_call_dispatch_test <build/guest/host_call_static>
+// With "inline", both of the guest's host calls are served inside translated code
+// (Process::set_inline_host_calls) and must behave exactly as when they stop the JIT; the
+// borrower check then also invalidates code while Dynarmic runs.
+// Usage: host_call_dispatch_test <build/guest/host_call_static> [inline]
 #include <signal.h>
 
 #include <string>
@@ -60,11 +63,15 @@ void check_borrower(zb::Process& process, zb::GuestThread& carrier) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    CHECK(argc == 2);
+    CHECK(argc == 2 || argc == 3);
+    const bool served_inline = argc == 3 && std::string(argv[2]) == "inline";
     zb::runtime_report().clear();
     zb::Process process;
     bool called = false;
+    // 0x19 is the unimplemented glCreateProgram the guest calls next.
+    if (served_inline) process.set_inline_host_calls({0xFE10, 0x19});
     process.set_host_call_handler([&](std::uint32_t index, zb::GuestThread& thread) {
+        CHECK(thread.serving_inline() == served_inline);
         if (index != 0xFE10) return false;
         CHECK(thread.regs()[0] == 7);
         check_borrower(process, thread);

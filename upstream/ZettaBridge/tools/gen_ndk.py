@@ -270,8 +270,10 @@ def dispatch_include(family, entries):
         for position, (host_type, kind, parameter_name) in enumerate(arguments):
             if kind != "scalar":
                 lines.append("    %s %s = %s(regs[%d]);" % (host_type, parameter_name, kind, position))
-                lines.append("    if (%s == nullptr) { regs[0] = regs[1] = 0; return reject(\"%s\", regs[%d]); }" %
-                             (parameter_name, name, position))
+                # The dead handle is read before the result registers are cleared, so the log
+                # names the value the guest passed rather than the 0 it gets back.
+                lines.append("    if (%s == nullptr) { const std::uint32_t dead = regs[%d]; regs[0] = regs[1] = 0; "
+                             "return reject(\"%s\", dead); }" % (parameter_name, position, name))
             else:
                 lines.append("    const %s %s = static_cast<%s>(regs[%d]);" %
                              (host_type, parameter_name, host_type, position))

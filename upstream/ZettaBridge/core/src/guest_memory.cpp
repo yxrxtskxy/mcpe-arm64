@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstring>
 
 #include "zb/log.h"
@@ -121,6 +122,17 @@ bool GuestMemory::accessible(std::uint32_t addr, std::uint64_t len, std::uint8_t
         if ((pages_[i] & mask) != mask) return false;
     }
     return true;
+}
+
+bool GuestMemory::any_executable(std::uint32_t addr, std::uint64_t len) const {
+    if (len == 0) return false;
+    const std::uint64_t end = std::min<std::uint64_t>(static_cast<std::uint64_t>(addr) + len, kGuestSpaceSize);
+    if (end <= addr) return false;
+    constexpr std::uint8_t mask = kPageMapped | kPageExec;
+    for (std::uint64_t i = addr >> 12, last = (end - 1) >> 12; i <= last; ++i) {
+        if ((pages_[i] & mask) == mask) return true;
+    }
+    return false;
 }
 
 std::uint8_t* GuestMemory::host_ptr(std::uint32_t addr, std::uint64_t len, std::uint8_t need) const {

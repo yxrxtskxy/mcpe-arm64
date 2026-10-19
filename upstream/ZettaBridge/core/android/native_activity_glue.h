@@ -20,6 +20,7 @@ public:
 
     bool read(std::uint64_t activity, Facts& facts) override;
     void attach(std::uint64_t activity, std::uint32_t guest_activity) override;
+    bool request(std::uint32_t guest_activity, Request request, std::uint32_t first, std::uint32_t second) override;
 
 private:
     // The framework calls these with its own ANativeActivity*; each one finds the guest activity

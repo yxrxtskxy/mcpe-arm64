@@ -40,13 +40,15 @@ bytes match this build of the game exactly.
 | Path | What |
 |---|---|
 | `android/` | The app (Gradle). Java sources of the ZettaBridge launcher are used in place from `upstream/`; `app/src/main` holds this project's manifest, resources, `GameLauncherActivity` and `GamePatches`. |
-| `patches/zettabridge/`, `patches/dynarmic/` | This project's changes to ZettaBridge and to its Dynarmic (see below), applied by `tools/fetch_zettabridge.sh`. |
+| `upstream/` | ZettaBridge and its Dynarmic, vendored, with this project's changes (see below) made in place. `upstream/README.md` names the upstream commits and shows how to list the changes. |
 | `tools/` | Toolchain setup, fetch, build and signing scripts. |
 | `tests/` | Local load test: Minecraft's libraries through the real guest linker on this PC. |
 | `game/` | Put `minecraft-1.1.5.apk` here (not committed). |
-| `upstream/`, `build/`, `out/`, `.deps/` | Fetched or generated. |
+| `build/`, `out/`, `.deps/` | Generated. |
 
-## Changes to ZettaBridge (`patches/zettabridge/0001-mcpe-arm64.patch`)
+## Changes to ZettaBridge
+
+In `upstream/ZettaBridge`.
 
 - **`ANativeActivity_*` helpers** (`finish`, `show/hideSoftInput`, `setWindowFlags/Format`): new guest
   stubs (host calls 579-583) forwarded to the framework activity. Minecraft imports
@@ -102,9 +104,9 @@ bytes match this build of the game exactly.
 - `PluginStore.importApk(Context, InputStream)` for the bundled APK, and a Windows path fix in
   `check_launcher_bundle.py`.
 
-## Changes to Dynarmic (`patches/dynarmic/0001-arm64-fast-dispatch.patch`)
+## Changes to Dynarmic
 
-Applied on top of ZettaBridge's own two Dynarmic patches.
+In `upstream/ZettaBridge/third_party/dynarmic`, on top of ZettaBridge's own two Dynarmic patches.
 
 - **Fast dispatch for the arm64 backend.** The x86_64 backend has a fast-dispatch cache; the arm64
   backend left it as a TODO. Without it, every indirect branch the return predictions miss
@@ -127,15 +129,14 @@ sh tools/release.sh               # add --install to put it on the connected pho
 The result is in `out/releases/<versionName>-arm64.<versionCode>/`:
 - `MinecraftPE-<versionName>-arm64.<versionCode>.apk`
 - `SHA256SUMS`
-- `BUILD-INFO.txt`, which records the game APK, the ZettaBridge commit and patch, the signing
-  certificate and the toolchain.
+- `BUILD-INFO.txt`, which records the game APK, the commit it was built from, the upstream
+  ZettaBridge and Dynarmic commits, the signing certificate and the toolchain.
 
 Any missing piece is set up first, and pieces already present are skipped:
 
 | Piece | Comes from |
 |---|---|
 | Android SDK 35, NDK r29, JDK 17, Gradle 8.11.1 | `tools/setup_toolchain_windows.sh`, checksum-verified |
-| `upstream/ZettaBridge` | `tools/fetch_zettabridge.sh`: the pinned commits plus `patches/` |
 | arm32 sysroot | `extract_sysroot.sh` in WSL: an AOSP GSI, ~1.2 GB download, needs `debugfs` |
 | Boost headers | WSL's `libboost-dev`, copied into `.deps/boost-headers` |
 | Signing key | `tools/make_signing_key.sh`, written to `~/.mcpe-arm64` |
@@ -147,10 +148,10 @@ the Boost headers are missing.
 (`1.1.5.1`). For a new release, bump `versionCode` in `android/app/build.gradle.kts`. Re-running
 with the same `versionCode` replaces that release.
 
-**Unsaved runtime changes.** `release.sh` refuses to build from an `upstream/ZettaBridge` checkout
-that differs from `patches/zettabridge`, because such a release could not be rebuilt later. While
-changing the runtime, `sh tools/build_apk.sh` builds `out/MinecraftPE-1.1.5-arm64.apk` from the
-checkout as it is. `BUILD_TYPE=debug` makes that build debuggable.
+**Uncommitted changes.** `release.sh` refuses to build while the repository has uncommitted
+changes, because such a release could not be rebuilt later. While changing the code,
+`sh tools/build_apk.sh` builds `out/MinecraftPE-1.1.5-arm64.apk` from the files as they are.
+`BUILD_TYPE=debug` makes that build debuggable.
 
 **Signing key.** Keep `~/.mcpe-arm64/`, which holds the key and its passwords. An update only
 installs over a build signed with the same key.
@@ -206,6 +207,8 @@ files/zb-runtime-report.txt` reads the report directly.
 ## Licences
 
 ZettaBridge is source-available under PolyForm Noncommercial 1.0.0 + PolyForm Perimeter 1.0.1:
-noncommercial use only, and no competing product. Dynarmic is 0BSD. The AOSP runtime libraries are
+noncommercial use only, and no competing product. Its licence text is in
+`upstream/ZettaBridge/LICENSE`, and covers that directory, this project's changes in it included.
+Dynarmic is 0BSD. The AOSP runtime libraries are
 Apache-2.0. Minecraft is Mojang's: build this only from a copy of the game you own, and do not
 distribute the resulting APK.

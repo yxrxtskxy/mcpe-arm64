@@ -46,6 +46,42 @@ public:
     // AAsset_getBuffer: the whole asset in host memory, or nullptr. HostAssets copies it into
     // guest memory; the pointer itself can never cross, being outside the guest's 4 GiB space.
     virtual const void* buffer(std::uint64_t asset) = 0;
+
+    // The rest of <android/asset_manager.h>. Not pure, so backends that predate them (the host
+    // test mock) keep building; the defaults report failure the way the NDK does for a bad handle.
+
+    // AAsset_getRemainingLength64. -1 for an invalid asset handle.
+    virtual std::int64_t remaining_length(std::uint64_t asset) {
+        (void)asset;
+        return -1;
+    }
+    // AAsset_seek64 (whence is SEEK_SET/SEEK_CUR/SEEK_END). The new position, or -1.
+    virtual std::int64_t seek(std::uint64_t asset, std::int64_t offset, int whence) {
+        (void)asset;
+        (void)offset;
+        (void)whence;
+        return -1;
+    }
+    // AAsset_isAllocated.
+    virtual int is_allocated(std::uint64_t asset) {
+        (void)asset;
+        return 0;
+    }
+    // AAssetManager_openDir. An opaque host directory handle, or 0.
+    virtual std::uint64_t open_dir(std::uint64_t manager, const std::string& dirname) {
+        (void)manager;
+        (void)dirname;
+        return 0;
+    }
+    // AAssetDir_getNextFileName: host memory owned by the directory, valid until the next call on
+    // it, or nullptr at the end.
+    virtual const char* next_file_name(std::uint64_t dir) {
+        (void)dir;
+        return nullptr;
+    }
+    // AAssetDir_rewind / AAssetDir_close. No-ops for an invalid handle.
+    virtual void rewind_dir(std::uint64_t dir) { (void)dir; }
+    virtual void close_dir(std::uint64_t dir) { (void)dir; }
 };
 
 }  // namespace zb

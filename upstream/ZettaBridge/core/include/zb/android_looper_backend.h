@@ -34,6 +34,9 @@ public:
 
     // ALooper_addFd with a host callback and opaque data. 1 on success, -1 on failure. Replacing
     // an fd already registered on the same looper is allowed and replaces callback and data.
+    // With callback == nullptr it is an ident registration (ident >= 0, the looper prepared with
+    // ALOOPER_PREPARE_ALLOW_NON_CALLBACKS): poll_once then returns `ident` with `data` as out_data,
+    // which is how a thread that polls its own real looper hands an ident back to the guest.
     virtual int add_fd(std::uint64_t looper, int fd, int ident, int events, Callback callback,
                        void* data) = 0;
     // ALooper_removeFd: 1 removed, 0 not registered, -1 invalid looper.

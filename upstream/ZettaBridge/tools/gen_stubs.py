@@ -198,6 +198,29 @@ def looper_pollall_names():
     return ["ALooper_pollAll"]
 
 
+def native_activity_names():
+    """The ANativeActivity_* helpers a guest calls on its own activity.
+
+    Appended last: Minecraft PE 1.1.5 imports ANativeActivity_finish, and one unresolved import
+    stops the whole library from loading. The five helpers of android/native_activity.h are
+    listed by name because the header also declares the ANativeActivity_createFunc typedef and
+    the guest-implemented ANativeActivity_onCreate, neither of which is a platform entry point.
+    Indices in core/include/zb/native_activity_hostcalls.h.
+    """
+    names = [
+        "ANativeActivity_finish",
+        "ANativeActivity_hideSoftInput",
+        "ANativeActivity_setWindowFlags",
+        "ANativeActivity_setWindowFormat",
+        "ANativeActivity_showSoftInput",
+    ]
+    text = open(os.path.join(INCLUDE, "android", "native_activity.h")).read()
+    for name in names:
+        if not re.search(r"\b%s\s*\(" % name, text):
+            sys.exit("%s is not declared in android/native_activity.h" % name)
+    return names
+
+
 def configuration_names():
     """Every AConfiguration_* entry point of the NDK header."""
     names = set()
@@ -235,6 +258,9 @@ LIBRARIES = [
     ("libandroid", looper_pollall_names),
     # GLES 1.1: linked by Unity 4.5, so the library has to exist for the guest to load at all.
     ("libGLESv1_CM", gles1_names),
+    # ANativeActivity_* helpers (finish, soft input, window flags/format), last for the same
+    # append-only reason. Minecraft PE imports ANativeActivity_finish.
+    ("libandroid", native_activity_names),
 ]
 
 

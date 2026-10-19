@@ -229,6 +229,11 @@ protected:
     JniBackend& backend_;
 
 private:
+    // ANativeActivity_* host calls (ZB_NATIVE_ACTIVITY_HC_*): r0 is the guest activity, r1/r2 the
+    // helper's arguments. Always served; a call the platform cannot forward is reported as
+    // unimplemented, like any other missing host call.
+    void serve_native_activity_call(std::uint32_t index, GuestThread& thread);
+
     LibraryRuntime* runtime_;
     HostJni* host_jni_;
     HostGl* host_gl_ = nullptr;

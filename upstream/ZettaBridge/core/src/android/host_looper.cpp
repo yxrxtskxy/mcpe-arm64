@@ -320,12 +320,40 @@ struct HostLooper::Impl {
         return binding->impl->dispatch_attached(*binding, fd, events);
     }
 
+    // Registers one guest registration on a real looper. A real-backed looper is polled by its
+    // own guest thread through the real pollOnce, so an ident registration (no guest callback)
+    // goes in as an ident: pollOnce then returns the ident with the guest's data word, exactly
+    // what the guest's ALooper_pollAll expects (android_native_app_glue's LOOPER_ID_MAIN pipe).
+    // Registering it with attached_callback instead made the real looper dispatch it, and the
+    // guest was entered at its null callback. An attached (borrower) looper is polled by Java's
+    // message loop, which cannot return anything to the guest, so it always needs the callback.
+    int add_real_fd(std::uint64_t real, bool polled_by_guest, const Registration& registration, Binding* binding) {
+        if (polled_by_guest && registration.callback == 0) {
+            return backend->add_fd(real, registration.fd, registration.ident, registration.events, nullptr,
+                                   reinterpret_cast<void*>(static_cast<std::uintptr_t>(registration.data)));
+        }
+        return backend->add_fd(real, registration.fd, registration.ident, registration.events,
+                               &Impl::attached_callback, binding);
+    }
+
     // Runs on the host thread that owns the real looper, from its own loop, with no guest code
     // running on it. Enters the guest and runs the guest callback with (fd, events, data), like
     // the guest path does from pollOnce. Returning 0 makes the real looper drop the fd.
     int dispatch_attached(Binding& binding, int fd, int events) {
         report_host_callbacks.fetch_add(1, std::memory_order_relaxed);
         if (!binding.active.load(std::memory_order_relaxed)) {
+            report_host_callbacks_line();
+            return 0;
+        }
+        // An ident registration on a looper Java polls: there is no guest function to run and no
+        // poll to report the ident to. Dropping the fd from the real looper keeps a readable
+        // descriptor from spinning the host thread; the guest's own registration stays.
+        if (binding.callback == 0) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                log("ALooper ident registration on fd %d is ready on a looper only Java polls; "
+                    "it has no guest callback, so the host looper stops watching it", fd);
+            }
             report_host_callbacks_line();
             return 0;
         }
@@ -433,8 +461,10 @@ struct HostLooper::Impl {
                std::uint32_t callback, std::uint32_t data) {
         int wake_fd = -1;
         std::uint64_t real = 0;
+        bool polled_by_guest = false;
         Binding* binding = nullptr;
         std::uint64_t serial = 0;
+        Registration added;
         {
             std::lock_guard<std::mutex> lock(mutex);
             const auto it = loopers.find(handle);
@@ -448,18 +478,18 @@ struct HostLooper::Impl {
                 return -1;
             }
             serial = next_serial++;
-            looper.registrations[fd] = Registration{fd, ident, events, callback, data, serial};
+            added = Registration{fd, ident, events, callback, data, serial};
+            looper.registrations[fd] = added;
             if (looper.attached || looper.real_backed) {
                 real = looper.real;
+                polled_by_guest = looper.real_backed;
                 binding = bind_locked(handle, fd, callback, data, serial);
             } else {
                 wake_fd = looper.wake_fd;
             }
         }
         if (real != 0) {
-            // The real looper needs a host callback even for a guest ident registration: only a
-            // callback gets control on the host thread, and nothing here ever calls pollOnce.
-            if (backend->add_fd(real, fd, ident, events, &Impl::attached_callback, binding) != 1) {
+            if (add_real_fd(real, polled_by_guest, added, binding) != 1) {
                 std::lock_guard<std::mutex> lock(mutex);
                 drop_registration_locked(handle, fd, serial);
                 return -1;
@@ -543,8 +573,8 @@ struct HostLooper::Impl {
                 binding = bind_locked(handle, registration.fd, registration.callback, registration.data,
                                       registration.serial);
             }
-            backend->add_fd(real, registration.fd, registration.ident, registration.events,
-                            &Impl::attached_callback, binding);
+            // This thread polls the real looper itself from now on (real_backed).
+            add_real_fd(real, true, registration, binding);
         }
         {
             std::lock_guard<std::mutex> lock(mutex);

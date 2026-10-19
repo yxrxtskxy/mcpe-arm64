@@ -16,6 +16,10 @@ The fixes edit a private extracted copy, never the APK:
    the emulator, so the linker's text relocations succeed without ever presenting a
    writable+executable segment.
 
+3. DT_NEEDED entries naming a platform library the runtime cannot provide (libOpenSLES.so,
+   libOpenMAXAL.so) become DT_ZB_DROPPED_NEEDED, which the guest linker ignores, so a library
+   that only links one of them still loads.
+
 Usage: fix_guest_lib.py <lib.so> [...]   (edits in place; prints what changed)
 """
 import struct
@@ -31,6 +35,10 @@ DT_FLAGS = 30
 DF_TEXTREL = 0x4
 # Keep in sync with core/include/zb/elf_fixups.h.
 DT_ZB_TEXTREL = 0x6000_5A42
+DT_ZB_DROPPED_NEEDED = 0x6000_5A43
+# Keep in sync with kAbsentPlatformLibraries in core/src/elf_fixups.cpp: platform libraries with
+# no arm32 copy and no host-call stubs, whose DT_NEEDED can never be satisfied.
+ABSENT_PLATFORM_LIBRARIES = {"libOpenSLES.so", "libOpenMAXAL.so"}
 
 
 def vaddr_to_offset(loads, vaddr):
@@ -77,7 +85,10 @@ def fix(path):
             end = data.index(b"\0", start)
             name = data[start:end].decode("latin-1")
             cut = max(name.rfind("/"), name.rfind("\\"))
-            if cut >= 0:
+            if name[cut + 1:] in ABSENT_PLATFORM_LIBRARIES:
+                struct.pack_into("<iI", data, off, DT_ZB_DROPPED_NEEDED, val)
+                changes.append("DT_NEEDED %s dropped (no guest copy of this platform library)" % name)
+            elif cut >= 0:
                 struct.pack_into("<iI", data, off, tag, val + cut + 1)
                 changes.append("DT_NEEDED %s -> %s" % (name, name[cut + 1:]))
         elif tag == DT_TEXTREL:

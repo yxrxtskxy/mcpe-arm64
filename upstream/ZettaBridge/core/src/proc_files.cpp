@@ -55,8 +55,21 @@ std::string cpuinfo_text() {
     return text;
 }
 
-int memfd_with(const std::string& text, int flags) {
+// An anonymous file for the synthesized text. memfd_create exists on every Android kernel; the
+// unlinked temporary file is only for hosts without it (WSL1's emulated kernel returns ENOSYS),
+// where the x86_64 test build of zbrun runs.
+int anonymous_file(int flags) {
     const int fd = static_cast<int>(::syscall(SYS_memfd_create, "zbridge-proc", (flags & O_CLOEXEC) ? kMfdCloexec : 0u));
+    if (fd >= 0 || errno != ENOSYS) return fd;
+    char path[] = "/tmp/zbridge-proc-XXXXXX";
+    const int tmp = ::mkostemp(path, (flags & O_CLOEXEC) ? O_CLOEXEC : 0);
+    if (tmp < 0) return -1;
+    ::unlink(path);
+    return tmp;
+}
+
+int memfd_with(const std::string& text, int flags) {
+    const int fd = anonymous_file(flags);
     if (fd < 0) return -errno;
     std::size_t done = 0;
     while (done < text.size()) {

@@ -1,3 +1,11 @@
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(ZB_NATIVE_THUNKS src/jni/thunks.S)
+else()
+    # x86_64 host-test builds (zbrun, zbfix, the guest suite): the JNI native-method thunks are
+    # AArch64 code for ART on the device, so this pool only reserves the addresses and traps.
+    set(ZB_NATIVE_THUNKS src/jni/thunks_unsupported.S)
+endif()
+
 add_library(zbcore STATIC
     src/android/host_looper.cpp
     src/android/host_native_window.cpp
@@ -34,7 +42,7 @@ add_library(zbcore STATIC
     src/jni/native_thunks.cpp
     src/jni/proxy_runtime.cpp
     src/jni/shorty.cpp
-    src/jni/thunks.S
+    ${ZB_NATIVE_THUNKS}
     src/library_runtime.cpp
     src/log.cpp
     src/proc_files.cpp
