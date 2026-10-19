@@ -17,8 +17,8 @@
 # Needs on PATH: git, curl, unzip, cmake, ninja, python3. WSL only while the sysroot or the Boost
 # headers are missing.
 #
-# For quick test builds while changing the code, use tools/build_apk.sh: this script refuses to
-# build with uncommitted changes, since such a release could not be rebuilt later.
+# Uncommitted changes are built too, and BUILD-INFO.txt then says so. For quick test builds
+# without a release folder, use tools/build_apk.sh.
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ZB="$ROOT/upstream/ZettaBridge"
@@ -59,18 +59,16 @@ done
 echo "game APK: $GAME_APK"
 
 step "sources"
-# What gets built must be a commit, or the release could not be rebuilt later. Ignored files
-# (build output, the sysroot, game/) do not count.
-CHANGES=$(git -C "$ROOT" status --porcelain)
-if [ -n "$CHANGES" ]; then
-    printf '%s\n' "$CHANGES" >&2
-    die "uncommitted changes (above): commit them first, or use tools/build_apk.sh for a test build"
+# The files are built as they are. With uncommitted changes the commit alone does not rebuild the
+# release, so BUILD-INFO.txt says so. Ignored files (build output, the sysroot, game/) do not count.
+SOURCE="commit $(git -C "$ROOT" rev-parse HEAD) of this repository"
+if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
+    SOURCE="$SOURCE, plus uncommitted changes"
 fi
-SOURCE_COMMIT=$(git -C "$ROOT" rev-parse HEAD)
 ZETTA_COMMIT=$(upstream_commit ZettaBridge)
 DYNARMIC_COMMIT=$(upstream_commit Dynarmic)
 [ -n "$ZETTA_COMMIT" ] && [ -n "$DYNARMIC_COMMIT" ] || die "upstream/README.md does not name the upstream commits"
-echo "commit $SOURCE_COMMIT"
+echo "$SOURCE"
 
 step "toolchain"
 sh "$ROOT/tools/setup_toolchain_windows.sh"
@@ -148,7 +146,7 @@ cp "$APK" "$DEST/$NAME"
     echo "built          $(date -u '+%Y-%m-%d %H:%M UTC')"
     echo
     echo "game           $(printf '%s\n' "$GAME_INFO" | sed -n 's/^package=//p'), sha256 $(printf '%s\n' "$GAME_INFO" | sed -n 's/^sha256=//p')"
-    echo "source         commit $SOURCE_COMMIT of this repository"
+    echo "source         $SOURCE"
     echo "ZettaBridge    $ZETTA_COMMIT + this project's changes (upstream/)"
     echo "Dynarmic       $DYNARMIC_COMMIT + ZettaBridge's third_party/patches + this project's changes"
     echo "NDK            $NDK_VERSION"

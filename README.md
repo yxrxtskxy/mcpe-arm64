@@ -148,10 +148,10 @@ the Boost headers are missing.
 (`1.1.5.1`). For a new release, bump `versionCode` in `android/app/build.gradle.kts`. Re-running
 with the same `versionCode` replaces that release.
 
-**Uncommitted changes.** `release.sh` refuses to build while the repository has uncommitted
-changes, because such a release could not be rebuilt later. While changing the code,
-`sh tools/build_apk.sh` builds `out/MinecraftPE-1.1.5-arm64.apk` from the files as they are.
-`BUILD_TYPE=debug` makes that build debuggable.
+**Uncommitted changes.** `release.sh` builds the files as they are, committed or not. If some
+changes are uncommitted, `BUILD-INFO.txt` says so, because the commit alone would not rebuild that
+release. For a quick test build without a release folder, `sh tools/build_apk.sh` builds
+`out/MinecraftPE-1.1.5-arm64.apk`. `BUILD_TYPE=debug` makes that build debuggable.
 
 **Signing key.** Keep `~/.mcpe-arm64/`, which holds the key and its passwords. An update only
 installs over a build signed with the same key.
