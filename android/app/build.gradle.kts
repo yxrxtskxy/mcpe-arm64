@@ -28,6 +28,14 @@ if (signingPropsFile.isFile) {
 val keystore: File? = signingProps.getProperty("storeFile")?.let { path -> File(path) }
 val hasKey = keystore != null && keystore.isFile
 
+// The app takes the game's own versionName (1.1.5.1), which tools/build_apk.sh reads from the
+// game APK into info.properties. versionCode stays this project's counter: bump it per release.
+val gameInfo = Properties()
+val gameInfoFile = File(appInputs, "assets/game/info.properties")
+if (gameInfoFile.isFile) {
+    gameInfoFile.inputStream().use { stream -> gameInfo.load(stream) }
+}
+
 android {
     namespace = "com.zettabridge.launcher"
     compileSdk = 35
@@ -35,11 +43,11 @@ android {
 
     defaultConfig {
         // Keep in sync with android:targetPackage in res/xml/shortcuts.xml.
-        applicationId = "com.mcpe115.arm64"
+        applicationId = "com.yxrxtskxy.mcpe.arm64"
         minSdk = 26
         targetSdk = 35
         versionCode = 2
-        versionName = "1.1.5-arm64.2"
+        versionName = gameInfo.getProperty("versionName")
         ndk { abiFilters += "arm64-v8a" }
     }
 

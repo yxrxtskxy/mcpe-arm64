@@ -12,7 +12,7 @@ calls through to the phone.
 ## How the APK is put together
 
 ```
-MinecraftPE-1.1.5-arm64.apk  (package com.mcpe115.arm64, lib/arm64-v8a only)
+MinecraftPE-1.1.5-arm64.apk  (package com.yxrxtskxy.mcpe.arm64, lib/arm64-v8a only)
  ├─ GameLauncherActivity      first launch: imports assets/game/base.apk as a plugin
  ├─ ZettaBridge launcher      plugin host: :guest process, stub activities, plugin Context/ClassLoader
  ├─ lib/arm64-v8a/libzbridge.so   translator + JNI bridge + NativeActivity glue
@@ -112,8 +112,8 @@ cp /path/to/minecraft-1.1.5.apk game/
 sh tools/release.sh               # add --install to put it on the connected phone
 ```
 
-The result is in `out/releases/<versionName>/`:
-- `MinecraftPE-<versionName>.apk`
+The result is in `out/releases/<versionName>-arm64.<versionCode>/`:
+- `MinecraftPE-<versionName>-arm64.<versionCode>.apk`
 - `SHA256SUMS`
 - `BUILD-INFO.txt`, which records the game APK, the ZettaBridge commit and patch, the signing
   certificate and the toolchain.
@@ -131,8 +131,9 @@ Any missing piece is set up first, and pieces already present are skipped:
 Git, curl, unzip, CMake, Ninja and Python 3 must be on `PATH`. WSL is used only while the sysroot or
 the Boost headers are missing.
 
-**Versions.** For a new release, bump `versionCode` and `versionName` in
-`android/app/build.gradle.kts`. Re-running with the same version replaces that release.
+**Versions.** The app's `versionName` is the game's own, read from the game APK at build time
+(`1.1.5.1`). For a new release, bump `versionCode` in `android/app/build.gradle.kts`. Re-running
+with the same `versionCode` replaces that release.
 
 **Unsaved runtime changes.** `release.sh` refuses to build from an `upstream/ZettaBridge` checkout
 that differs from `patches/zettabridge`, because such a release could not be rebuilt later. While
@@ -187,7 +188,7 @@ sh tools/wsl_build_host_x64.sh && sh tests/run_mcpe_dlopen.sh
 
 Troubleshooting on the phone: long-press the app icon → **Runtime tools** → the game → *Last run
 report*. Then `adb logcat -s zbridge zb-launcher mcpe-arm64 MinecraftPE`. With a debug build
-(`BUILD_TYPE=debug sh tools/build_apk.sh`), `adb shell run-as com.mcpe115.arm64 cat
+(`BUILD_TYPE=debug sh tools/build_apk.sh`), `adb shell run-as com.yxrxtskxy.mcpe.arm64 cat
 files/zb-runtime-report.txt` reads the report directly.
 
 ## Licences

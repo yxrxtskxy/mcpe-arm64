@@ -9,7 +9,7 @@
         android:shortcutShortLabel="@string/runtime_tools">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetPackage="com.mcpe115.arm64"
+            android:targetPackage="com.yxrxtskxy.mcpe.arm64"
             android:targetClass="com.zettabridge.launcher.LibraryActivity" />
     </shortcut>
 </shortcuts>

@@ -44,13 +44,18 @@ cp -R "$ZB/build/launcher/jniLibs" "$INPUTS/jniLibs"
 cp "$GAME_APK" "$INPUTS/assets/game/base.apk"
 GAME_SHA=$(sha256sum "$GAME_APK" | cut -d' ' -f1)
 GAME_PACKAGE=$("$BUILD_TOOLS/aapt2.exe" dump packagename "$(cygpath -m "$GAME_APK")" | tr -d '\r')
-printf 'package=%s\nsha256=%s\n' "$GAME_PACKAGE" "$GAME_SHA" > "$INPUTS/assets/game/info.properties"
+# The app's versionName is the game's own (android/app/build.gradle.kts reads it from here).
+GAME_VERSION=$("$BUILD_TOOLS/aapt2.exe" dump badging "$(cygpath -m "$GAME_APK")" | tr -d '\r' |
+    sed -n "s/^package:.* versionName='\([^']*\)'.*/\1/p")
+[ -n "$GAME_VERSION" ] || { echo "no versionName in $GAME_APK" >&2; exit 1; }
+printf 'package=%s\nsha256=%s\nversionName=%s\n' "$GAME_PACKAGE" "$GAME_SHA" "$GAME_VERSION" \
+    > "$INPUTS/assets/game/info.properties"
 # The launcher icon is the game's own, taken from its APK at build time.
 for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
     mkdir -p "$INPUTS/res/mipmap-$density"
     unzip -p "$GAME_APK" "res/drawable-$density-v4/icon.png" > "$INPUTS/res/mipmap-$density/ic_launcher.png"
 done
-echo "game: $GAME_PACKAGE sha256=$GAME_SHA"
+echo "game: $GAME_PACKAGE $GAME_VERSION sha256=$GAME_SHA"
 
 # BUILD_TYPE=debug makes a debuggable APK (same key, installs over a release build) so that
 # `adb shell run-as` can read the runtime report and the game's files while it is being fixed.
@@ -67,8 +72,10 @@ BUILT="$ROOT/android/app/build/outputs/apk/$BUILD_TYPE/app-$BUILD_TYPE.apk"
 step "checks"
 "$BUILD_TOOLS/zipalign.exe" -c -P 16 4 "$(cygpath -m "$BUILT")" && echo "zipalign: OK (16 KiB pages)"
 "$BUILD_TOOLS/apksigner.bat" verify --print-certs "$(cygpath -m "$BUILT")" | head -3
-"$BUILD_TOOLS/aapt2.exe" dump badging "$(cygpath -m "$BUILT")" | tr -d '\r' \
-    | grep -E "^package|native-code|launchable-activity|sdkVersion|targetSdkVersion"
+BADGING=$("$BUILD_TOOLS/aapt2.exe" dump badging "$(cygpath -m "$BUILT")" | tr -d '\r')
+printf '%s\n' "$BADGING" | grep -E "^package|native-code|launchable-activity|sdkVersion|targetSdkVersion"
+printf '%s\n' "$BADGING" | grep -q "^package:.* versionName='$GAME_VERSION'" ||
+    { echo "the built APK's versionName is not the game's ($GAME_VERSION)" >&2; exit 1; }
 mkdir -p "$(dirname "$OUT")"
 cp "$BUILT" "$OUT"
 ls -la "$OUT"

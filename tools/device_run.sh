@@ -8,7 +8,7 @@ set -eu
 export MSYS_NO_PATHCONV=1
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ADB=${ADB:-$(cygpath -u "$LOCALAPPDATA")/Android/Sdk/platform-tools/adb.exe}
-PACKAGE=com.mcpe115.arm64
+PACKAGE=com.yxrxtskxy.mcpe.arm64
 WAIT=${1:-25}
 APK="$ROOT/out/MinecraftPE-1.1.5-arm64.apk"
 LOG="$ROOT/logs/device-$(date +%Y%m%d-%H%M%S).log"

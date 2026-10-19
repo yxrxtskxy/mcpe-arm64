@@ -1,13 +1,13 @@
 #!/bin/sh
 # One command from a fresh checkout to a release (Git Bash on Windows):
 #   sh tools/release.sh [--install]
-# Sets up whatever is missing, builds the release APK and packs it in out/releases/<versionName>/
-# with its checksum and a record of what went into it. Finished steps are skipped, so re-running
+# Sets up whatever is missing, builds the release APK and packs it in
+# out/releases/<versionName>-arm64.<versionCode>/ with its checksum and a record of what went into it. Finished steps are skipped, so re-running
 # only rebuilds. --install then puts it on the connected phone with `adb install -r`, which keeps
 # the worlds (ANDROID_SERIAL picks one of several phones).
 #
-# A new release needs a new version: bump versionCode and versionName in
-# android/app/build.gradle.kts. Re-running with the same version replaces that release.
+# A new release needs a new versionCode: bump it in android/app/build.gradle.kts. versionName is
+# the game APK's own (1.1.5.1). Re-running with the same versionCode replaces that release.
 #
 # Where each piece comes from (each is skipped once present):
 #   Android SDK, NDK r29, JDK 17, Gradle   tools/setup_toolchain_windows.sh, checksum-verified
@@ -161,6 +161,8 @@ PACKAGE_LINE=$(printf '%s\n' "$BADGING" | grep '^package:')
 PACKAGE=$(printf '%s\n' "$PACKAGE_LINE" | sed "s/.* name='\([^']*\)'.*/\1/")
 VERSION_CODE=$(printf '%s\n' "$PACKAGE_LINE" | sed "s/.* versionCode='\([^']*\)'.*/\1/")
 VERSION_NAME=$(printf '%s\n' "$PACKAGE_LINE" | sed "s/.* versionName='\([^']*\)'.*/\1/")
+# versionName is the game's, the same for every release, so the release is named by versionCode too.
+RELEASE="$VERSION_NAME-arm64.$VERSION_CODE"
 CERT=$("$BUILD_TOOLS/apksigner.bat" verify --print-certs "$(cygpath -m "$APK")" 2>/dev/null | tr -d '\r' |
     sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
 [ -n "$CERT" ] || die "apksigner could not verify $APK"
@@ -168,17 +170,17 @@ GAME_INFO=$(unzip -p "$APK" assets/game/info.properties | tr -d '\r')
 NDK_VERSION=$(sed -n 's/^Pkg.Revision *= *//p' "$NDK_DIR/source.properties" | tr -d '\r')
 BOOST_VERSION=$(sed -n 's/^#define BOOST_LIB_VERSION "\(.*\)"/\1/p' "$BOOST/boost/version.hpp")
 
-DEST="$ROOT/out/releases/$VERSION_NAME"
-NAME="MinecraftPE-$VERSION_NAME.apk"
+DEST="$ROOT/out/releases/$RELEASE"
+NAME="MinecraftPE-$RELEASE.apk"
 if [ -d "$DEST" ]; then
-    echo "replacing release $VERSION_NAME (for a new one, bump versionCode and versionName in android/app/build.gradle.kts)"
+    echo "replacing release $RELEASE (for a new one, bump versionCode in android/app/build.gradle.kts)"
 fi
 rm -rf "$DEST"
 mkdir -p "$DEST"
 cp "$APK" "$DEST/$NAME"
 (cd "$DEST" && sha256sum "$NAME" > SHA256SUMS)
 {
-    echo "Minecraft PE 1.1.5 for arm64-only phones, release $VERSION_NAME"
+    echo "Minecraft PE 1.1.5 for arm64-only phones, release $RELEASE"
     echo
     echo "apk            $NAME"
     echo "sha256         $(cut -d' ' -f1 "$DEST/SHA256SUMS")"
@@ -210,7 +212,7 @@ if [ "$INSTALL" = 1 ]; then
 fi
 
 step "done"
-echo "release $VERSION_NAME: $DEST/$NAME"
+echo "release $RELEASE: $DEST/$NAME"
 if [ "$NEW_KEY" = 1 ]; then
     echo "A new signing key was created in ~/.mcpe-arm64. Back it up: updates only install over"
     echo "builds signed with the same key."
