@@ -1,5 +1,5 @@
-# Fetched and generated: recreate with tools/fetch_zettabridge.sh and tools/build_apk.sh.
-/upstream/
+# Generated: recreate with tools/build_apk.sh. (upstream/ keeps its own .gitignore files for its
+# build/, sysroot/ and .cache/.)
 /build/
 /out/
 /logs/

@@ -2,3 +2,6 @@
 # git apply needs the patches byte for byte (they also carry binary hunks).
 * text=auto eol=lf
 *.patch -text
+# Committed with CRLF upstream (Dynarmic's bundled xbyak): kept byte for byte.
+/upstream/ZettaBridge/third_party/dynarmic/externals/xbyak/COPYRIGHT -text
+/upstream/ZettaBridge/third_party/dynarmic/externals/xbyak/readme.txt -text
