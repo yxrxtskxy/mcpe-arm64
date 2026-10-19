@@ -1,0 +1,14 @@
+# Fetched and generated: recreate with tools/fetch_zettabridge.sh and tools/build_apk.sh.
+/upstream/
+/build/
+/out/
+/logs/
+/.deps/
+# The game APK is the user's own copy; never commit it.
+/game/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+# Editor state of this machine.
+/.vscode/

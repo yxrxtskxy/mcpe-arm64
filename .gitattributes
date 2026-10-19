@@ -1,0 +1,4 @@
+# LF in every checkout, also on Windows with core.autocrlf=true: sh rejects scripts with CRLF, and
+# git apply needs the patches byte for byte (they also carry binary hunks).
+* text=auto eol=lf
+*.patch -text
