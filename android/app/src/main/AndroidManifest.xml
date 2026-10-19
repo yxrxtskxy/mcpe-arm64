@@ -121,6 +121,19 @@
             android:process=":guest"
             android:taskAffinity="com.zettabridge.launcher.guest"
             android:theme="@android:style/Theme.Material.NoActionBar" />
+        <!-- Custom skins: the game's image pick opens the system file picker here, and the game
+             reads a private copy of the chosen image through PickedImageProvider. -->
+        <activity
+            android:name=".ImagePickActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode"
+            android:exported="false"
+            android:process=":guest"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <provider
+            android:name=".PickedImageProvider"
+            android:authorities="${applicationId}.pickedimage"
+            android:exported="false"
+            android:process=":guest" />
         <!-- AndroidIDE injects the Kotlin-based LogWire logger into debug builds; this app has no
              Kotlin stdlib. Harmless elsewhere. -->
         <provider

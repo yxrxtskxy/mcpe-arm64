@@ -88,6 +88,7 @@ public class GameLauncherActivity extends Activity {
                     throw new IOException("the bundled APK is " + imported.packageName + ", not " + packageName);
                 }
                 if (!imported.isLaunchable()) throw new IOException("the bundled game is not launchable: " + imported.status());
+                GamePatches.apply(imported.libDir());
                 writeImportedFrom(imported, importKey);
                 Log.i(TAG, "imported " + imported.packageName + " " + imported.versionName + " (" + imported.status() + ")");
                 runOnUiThread(this::launch);

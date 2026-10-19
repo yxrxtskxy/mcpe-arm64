@@ -1,3 +1,27 @@
+diff --git a/android/launcher/app/src/main/AndroidManifest.xml b/android/launcher/app/src/main/AndroidManifest.xml
+index b00d147..c695704 100644
+--- a/android/launcher/app/src/main/AndroidManifest.xml
++++ b/android/launcher/app/src/main/AndroidManifest.xml
+@@ -98,6 +98,19 @@
+             android:process=":guest"
+             android:taskAffinity="com.zettabridge.launcher.guest"
+             android:theme="@android:style/Theme.Material.NoActionBar" />
++        <!-- Stands in for the gallery when a plugin picks an image: the system file picker, then a
++             private copy served by PickedImageProvider (GuestRuntime.route). -->
++        <activity
++            android:name=".ImagePickActivity"
++            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode"
++            android:exported="false"
++            android:process=":guest"
++            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
++        <provider
++            android:name=".PickedImageProvider"
++            android:authorities="${applicationId}.pickedimage"
++            android:exported="false"
++            android:process=":guest" />
+         <!-- AndroidIDE injects the Kotlin-based LogWire logger into debug builds. This app has no
+              Kotlin stdlib, so its init provider crashes the main process. Drop it. -->
+         <provider
 diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/Diagnostics.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/Diagnostics.java
 index b0f85c4..a5e0fb8 100644
 --- a/android/launcher/app/src/main/java/com/zettabridge/launcher/Diagnostics.java
@@ -47,6 +71,125 @@ index b0f85c4..a5e0fb8 100644
              if (dir == null) return;
              try (FileOutputStream out = new FileOutputStream(new File(dir, "zb-errors.txt"), true)) {
                  out.write((text + "\n").getBytes(StandardCharsets.UTF_8));
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
+index c1dfba7..82c4694 100644
+--- a/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/GuestRuntime.java
+@@ -129,9 +129,14 @@ final class GuestRuntime {
+         return n != null && n > 0;
+     }
+ 
+-    /** Rewrites an intent that names a plugin activity to the matching stub; others pass through. */
++    /**
++     * Rewrites an intent that names a plugin activity to the matching stub, and an image pick to
++     * ImagePickActivity; others pass through.
++     */
+     Intent route(Intent intent) {
+-        if (intent == null || intent.getComponent() == null) return intent;
++        if (intent == null) return null;
++        if (ImagePickActivity.handles(intent)) return ImagePickActivity.intent(host);
++        if (intent.getComponent() == null) return intent;
+         if (host.getPackageName().equals(intent.getComponent().getPackageName())
+                 && intent.getComponent().getClassName().startsWith(Stubs.class.getName())) {
+             return intent;  // already a stub intent
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/ImagePickActivity.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/ImagePickActivity.java
+new file mode 100644
+index 0000000..c08a42d
+--- /dev/null
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/ImagePickActivity.java
+@@ -0,0 +1,92 @@
++package com.zettabridge.launcher;
++
++import android.app.Activity;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.net.Uri;
++import android.os.Bundle;
++import android.util.Log;
++import android.widget.Toast;
++
++import java.io.IOException;
++
++/**
++ * Stands in for the gallery when a plugin starts ACTION_PICK on images (GuestRuntime.route).
++ * Old apps read the picked image's path from the MediaStore "_data" column and open the file
++ * themselves; Minecraft PE's custom skins do. Under scoped storage that path is often unreadable,
++ * Photos and document providers have no such column, and a phone may have no app for ACTION_PICK
++ * at all. This opens the system file picker instead, copies the chosen image into the launcher's
++ * cache and answers with a PickedImageProvider URI, whose "_data" is the copy.
++ */
++public final class ImagePickActivity extends Activity {
++    private static final String TAG = "zb-launcher";
++    private static final int REQUEST_PICK = 1;
++
++    /** An ACTION_PICK for an image: by MIME type, or by a MediaStore images collection as data. */
++    static boolean handles(Intent intent) {
++        if (!Intent.ACTION_PICK.equals(intent.getAction()) || intent.getComponent() != null) return false;
++        String type = intent.getType();
++        if (type != null) return type.startsWith("image/") || type.equals("vnd.android.cursor.dir/image");
++        Uri data = intent.getData();
++        return data != null && "media".equals(data.getAuthority()) && data.getPathSegments().contains("images");
++    }
++
++    static Intent intent(Context host) {
++        return new Intent(host, ImagePickActivity.class);
++    }
++
++    @Override
++    protected void onCreate(Bundle state) {
++        super.onCreate(state);
++        if (state != null) return;  // recreated while the picker is open; its result still comes here
++        if (!startPicker(Intent.ACTION_OPEN_DOCUMENT) && !startPicker(Intent.ACTION_GET_CONTENT)) {
++            Toast.makeText(this, "No app on this phone can pick an image", Toast.LENGTH_LONG).show();
++            setResult(RESULT_CANCELED);
++            finish();
++        }
++    }
++
++    private boolean startPicker(String action) {
++        try {
++            startActivityForResult(new Intent(action).addCategory(Intent.CATEGORY_OPENABLE).setType("image/*"),
++                    REQUEST_PICK);
++            return true;
++        } catch (ActivityNotFoundException e) {
++            return false;
++        }
++    }
++
++    @Override
++    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
++        if (requestCode != REQUEST_PICK) return;
++        Uri picked = resultCode == RESULT_OK && data != null ? data.getData() : null;
++        if (picked == null) {
++            setResult(RESULT_CANCELED);
++            finish();
++            return;
++        }
++        // A document provider may fetch the image over the network: copy off the main thread.
++        new Thread(() -> {
++            Uri copy = copy(picked);
++            runOnUiThread(() -> {
++                if (copy != null) {
++                    setResult(RESULT_OK, new Intent().setData(copy));
++                } else {
++                    Toast.makeText(this, "Cannot read the picked image", Toast.LENGTH_LONG).show();
++                    setResult(RESULT_CANCELED);
++                }
++                finish();
++            });
++        }, "zb-image-pick").start();
++    }
++
++    private Uri copy(Uri picked) {
++        try {
++            return PickedImageProvider.store(this, picked);
++        } catch (IOException | RuntimeException e) {
++            Log.w(TAG, "cannot copy the picked image " + picked, e);
++            return null;
++        }
++    }
++}
 diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/ImplicitLibraries.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/ImplicitLibraries.java
 new file mode 100644
 index 0000000..e6983f6
@@ -127,6 +270,130 @@ index 015adda..df3ee19 100644
  
          LoadedPlugin p = new LoadedPlugin(record, ai, res, cl);
          p.info = info;
+diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/PickedImageProvider.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/PickedImageProvider.java
+new file mode 100644
+index 0000000..b55d250
+--- /dev/null
++++ b/android/launcher/app/src/main/java/com/zettabridge/launcher/PickedImageProvider.java
+@@ -0,0 +1,118 @@
++package com.zettabridge.launcher;
++
++import android.content.ContentProvider;
++import android.content.ContentValues;
++import android.content.Context;
++import android.database.Cursor;
++import android.database.MatrixCursor;
++import android.net.Uri;
++import android.os.ParcelFileDescriptor;
++import android.provider.OpenableColumns;
++import android.webkit.MimeTypeMap;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++
++/**
++ * Images picked through ImagePickActivity, as private copies in the launcher's cache. query
++ * answers the columns old apps read, "_data" being the copy's path, which they open directly;
++ * openFile serves the copy to apps that read the URI instead. Not exported.
++ */
++public final class PickedImageProvider extends ContentProvider {
++    private static final String DIR = "picked-images";
++    /** MediaStore.MediaColumns.DATA: deprecated, and exactly what those apps ask for. */
++    private static final String DATA = "_data";
++    private static final String MIME_TYPE = "mime_type";
++
++    /**
++     * Copies a picked image here and returns its URI. Only the latest pick is kept: by the next
++     * one, the app has read the previous copy (Minecraft PE stores its own copy of a skin).
++     */
++    static Uri store(Context c, Uri picked) throws IOException {
++        String type = c.getContentResolver().getType(picked);
++        String extension = type != null ? MimeTypeMap.getSingleton().getExtensionFromMimeType(type) : null;
++        File dir = new File(c.getCacheDir(), DIR);
++        PluginFiles.deleteRecursive(dir);
++        File copy = new File(dir, "image-" + System.currentTimeMillis() + "." + (extension != null ? extension : "png"));
++        try (InputStream in = c.getContentResolver().openInputStream(picked)) {
++            if (in == null) throw new IOException("no data behind " + picked);
++            PluginFiles.copyAtomic(in, copy);
++        }
++        return new Uri.Builder().scheme("content").authority(c.getPackageName() + ".pickedimage")
++                .appendPath(copy.getName()).build();
++    }
++
++    /** The copy a URI names, or null: only a plain file name directly inside DIR. */
++    private File file(Uri uri) {
++        String name = uri.getLastPathSegment();
++        if (uri.getPathSegments().size() != 1 || name.startsWith(".") || name.contains("/")) return null;
++        File file = new File(new File(getContext().getCacheDir(), DIR), name);
++        return file.isFile() ? file : null;
++    }
++
++    @Override
++    public boolean onCreate() {
++        return true;
++    }
++
++    @Override
++    public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
++        File file = file(uri);
++        if (file == null) return null;
++        String[] columns = projection != null ? projection
++                : new String[] {DATA, OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE, MIME_TYPE};
++        Object[] row = new Object[columns.length];
++        for (int i = 0; i < columns.length; i++) {
++            switch (columns[i]) {
++                case DATA:
++                    row[i] = file.getPath();
++                    break;
++                case OpenableColumns.DISPLAY_NAME:
++                    row[i] = file.getName();
++                    break;
++                case OpenableColumns.SIZE:
++                    row[i] = file.length();
++                    break;
++                case MIME_TYPE:
++                    row[i] = getType(uri);
++                    break;
++                default:
++                    break;  // unknown columns read as null
++            }
++        }
++        MatrixCursor cursor = new MatrixCursor(columns, 1);
++        cursor.addRow(row);
++        return cursor;
++    }
++
++    @Override
++    public String getType(Uri uri) {
++        String name = uri.getLastPathSegment();
++        int dot = name != null ? name.lastIndexOf('.') : -1;
++        return dot >= 0 ? MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substring(dot + 1)) : null;
++    }
++
++    @Override
++    public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
++        File file = file(uri);
++        if (file == null) throw new FileNotFoundException(uri.toString());
++        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY);
++    }
++
++    @Override
++    public Uri insert(Uri uri, ContentValues values) {
++        return null;
++    }
++
++    @Override
++    public int delete(Uri uri, String selection, String[] selectionArgs) {
++        return 0;
++    }
++
++    @Override
++    public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
++        return 0;
++    }
++}
 diff --git a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java b/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java
 index 75ad757..c4c5023 100644
 --- a/android/launcher/app/src/main/java/com/zettabridge/launcher/PluginContext.java

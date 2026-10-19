@@ -27,11 +27,19 @@ libraries are extracted and fixed up for the modern linker. After that every lau
 into the game. Worlds live in the app's private storage (scoped storage blocks
 `/sdcard/games/com.mojang` on Android 11+). Uninstalling the app deletes them.
 
+**Custom skins.** "Choose New Skin" opens the system file picker. The launcher copies the chosen
+image into its cache and gives the game that copy's path (`ImagePickActivity`,
+`PickedImageProvider`). The game used to ask for `WRITE_EXTERNAL_STORAGE` first, which this app
+cannot be granted on Android 11+, and then opened nothing. After each import, `GamePatches.java`
+changes one byte in `libminecraftpe.so`, so the skin picker opens without that permission. The
+world storage location still needs the permission. The change is only applied if the function's
+bytes match this build of the game exactly.
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `android/` | The app (Gradle). Java sources of the ZettaBridge launcher are used in place from `upstream/`; `app/src/main` holds this project's manifest, resources and `GameLauncherActivity`. |
+| `android/` | The app (Gradle). Java sources of the ZettaBridge launcher are used in place from `upstream/`; `app/src/main` holds this project's manifest, resources, `GameLauncherActivity` and `GamePatches`. |
 | `patches/zettabridge/`, `patches/dynarmic/` | This project's changes to ZettaBridge and to its Dynarmic (see below), applied by `tools/fetch_zettabridge.sh`. |
 | `tools/` | Toolchain setup, fetch, build and signing scripts. |
 | `tests/` | Local load test: Minecraft's libraries through the real guest linker on this PC. |
@@ -72,6 +80,10 @@ into the game. Worlds live in the app's private storage (scoped storage blocks
   - `RECEIVER_EXPORTED` added for those apps.
   - `Resources.getIdentifier` mapping the host package to the game's.
   - `ANativeActivity_onCreate` finding `ZBridge` from any thread.
+  - Image picks (`ACTION_PICK` on images) open the system file picker through `ImagePickActivity`.
+    The result is a private copy whose MediaStore `_data` column is a readable path
+    (`PickedImageProvider`). Old apps open that path themselves. Under scoped storage the original
+    path is often unreadable, and Photos or document picks have no `_data` column at all.
 - **GL calls served inside translated code.** A host call used to stop the JIT and enter it again.
   That costs more than most GL calls do, and it wipes the JIT's return predictions, so the
   returns that follow went through the slow dispatcher too. At high view distance the game makes
