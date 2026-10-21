@@ -101,8 +101,10 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
         log("GLES trace: %s(0x%x, 0x%x, 0x%x, 0x%x)", name, thread.regs()[0], thread.regs()[1],
             thread.regs()[2], thread.regs()[3]);
     }
-    // A thread's id never changes, and the syscall cost more than many of the GL calls it labels.
-    static thread_local const std::uint64_t host_tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+    // The guest thread knows its host thread; a gettid syscall, or a thread_local (dynamic TLS in
+    // this dlopened library), cost more than many of the GL calls it labels.
+    const std::uint64_t host_tid =
+        thread.tid != 0 ? static_cast<std::uint64_t>(thread.tid) : static_cast<std::uint64_t>(::syscall(SYS_gettid));
     runtime_report().note_gl_call(name, host_tid);
     const std::uint64_t egl_generation = runtime_report().egl_current_generation();
     if (egl_generation != gl_thread_sampled_generation_) {
@@ -119,7 +121,7 @@ bool HostGl::handle_host_call(std::uint32_t index, GuestThread& thread) {
         // Visibility diagnostics query the driver, so they run only once the Android runtime
         // enables them; mock-backend tests keep exact call logs.
         if (call.valid() && gl_diagnostics_enabled()) gl_diagnose(*this, call);
-        if (call.valid() && std::strcmp(name, "glGetError") == 0) {
+        if (call.valid() && index == ZB_GL_HC_glGetError) {
             const std::uint32_t error = thread.regs()[0];
             if (error != 0) runtime_report().note_gl_error(name, error);
         }

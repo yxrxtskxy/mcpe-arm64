@@ -111,17 +111,30 @@ void report_profile() {
 }
 }  // namespace
 
+namespace {
+// This runs on every guest syscall and host call, so the common path must not scan the table:
+// each thread remembers its own slot after claiming it once. One thread_local, not two: in this
+// dlopened library each access is a call into the dynamic linker's TLS resolver.
+struct MySlot {
+    Slot* slot = nullptr;
+    std::int32_t tid = 0;
+};
+thread_local MySlot t_mine;
+
+// Only the owning thread writes its slot's counter: a load and a store, not an atomic add.
+void count(Slot& slot) {
+    slot.counter.store(slot.counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+}  // namespace
+
 void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id) {
     if (tid == 0) return;
-    // This runs on every guest syscall and host call, so the common path must not scan the table:
-    // each thread remembers its own slot after claiming it once.
-    static thread_local Slot* mine = nullptr;
-    static thread_local std::int32_t mine_tid = 0;
-    if (mine != nullptr && mine_tid == tid) {
-        mine->kind.store(static_cast<std::uint8_t>(kind), std::memory_order_relaxed);
-        mine->id.store(id, std::memory_order_relaxed);
-        mine->counter.fetch_add(1, std::memory_order_relaxed);
-        mine->in_progress.store(true, std::memory_order_relaxed);
+    MySlot& mine = t_mine;
+    if (mine.slot != nullptr && mine.tid == tid) {
+        mine.slot->kind.store(static_cast<std::uint8_t>(kind), std::memory_order_relaxed);
+        mine.slot->id.store(id, std::memory_order_relaxed);
+        count(*mine.slot);
+        mine.slot->in_progress.store(true, std::memory_order_relaxed);
         return;
     }
     // Find an existing slot for this tid, or claim the first free one. A relaxed CAS race
@@ -133,10 +146,9 @@ void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint
         if (current == tid) {
             slot.kind.store(static_cast<std::uint8_t>(kind), std::memory_order_relaxed);
             slot.id.store(id, std::memory_order_relaxed);
-            slot.counter.fetch_add(1, std::memory_order_relaxed);
+            count(slot);
             slot.in_progress.store(true, std::memory_order_relaxed);
-            mine = &slot;
-            mine_tid = tid;
+            mine = {&slot, tid};
             return;
         }
         if (current == 0 && free_slot == nullptr) free_slot = &slot;
@@ -150,31 +162,24 @@ void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint
     free_slot->kind.store(static_cast<std::uint8_t>(kind), std::memory_order_relaxed);
     free_slot->id.store(id, std::memory_order_relaxed);
     free_slot->counter.store(1, std::memory_order_relaxed);
-    mine = free_slot;
-    mine_tid = tid;
+    mine = {free_slot, tid};
 }
 
 void record_thread_activity(std::int32_t tid, ThreadActivityKind kind, std::uint32_t id, std::uint32_t guest_lr,
                             std::uint32_t guest_sp) {
     record_thread_activity(tid, kind, id);
-    static thread_local Slot* mine = nullptr;
-    static thread_local std::int32_t mine_tid = 0;
-    if (mine == nullptr || mine_tid != tid) {
-        mine = nullptr;
-        for (Slot& slot : g_slots) {
-            if (slot.tid.load(std::memory_order_relaxed) == tid) {
-                mine = &slot;
-                mine_tid = tid;
-                break;
-            }
-        }
-        if (mine == nullptr) return;
-    }
-    mine->guest_lr.store(guest_lr, std::memory_order_relaxed);
-    mine->guest_sp.store(guest_sp, std::memory_order_relaxed);
+    const MySlot& mine = t_mine;
+    if (mine.slot == nullptr || mine.tid != tid) return;
+    mine.slot->guest_lr.store(guest_lr, std::memory_order_relaxed);
+    mine.slot->guest_sp.store(guest_sp, std::memory_order_relaxed);
 }
 
 void record_thread_activity_done(std::int32_t tid) {
+    const MySlot& mine = t_mine;
+    if (mine.slot != nullptr && mine.tid == tid) {
+        mine.slot->in_progress.store(false, std::memory_order_relaxed);
+        return;
+    }
     for (Slot& slot : g_slots) {
         if (slot.tid.load(std::memory_order_relaxed) == tid) {
             slot.in_progress.store(false, std::memory_order_relaxed);

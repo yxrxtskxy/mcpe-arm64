@@ -188,9 +188,18 @@ public:
     // The sampling profiler's tick: asks every guest thread that is running guest code (not
     // blocked in a syscall) for a sample.
     static void request_profile_samples();
-    // Time every live guest thread, borrowers included, has spent translating so far (the freeze
-    // tracer, hitch_trace.h); 0 before the process runs.
-    static std::uint64_t translation_ns_all_threads();
+    // What every live guest thread, borrowers included, has translated so far, summed (the freeze
+    // tracer, hitch_trace.h); all zero before the process runs.
+    struct TranslationTotals {
+        std::size_t threads = 0;
+        Dynarmic::A32::Jit::TranslationStats stats;
+        // The threads that translated the most: host tid and blocks, most first.
+        std::array<std::pair<std::int32_t, std::uint64_t>, 8> busiest{};
+    };
+    static TranslationTotals translation_totals();
+    // Starts the thread that releases the translations of guest threads idle for two minutes
+    // (GuestThread::release_translations_if_idle), once per process.
+    static void start_translation_trimmer();
     // svc #0x50|rB from a rewritten spinlock (elf_fixups.h): waits until the lock byte is free.
     void spin_wait(GuestThread& thread, std::uint32_t lock_address);
 

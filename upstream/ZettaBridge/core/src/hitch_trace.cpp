@@ -230,22 +230,27 @@ void log_hitch(const FrameState& frame, const ThreadWaits& waits, std::int32_t t
     log("%s", line.c_str());
 }
 
-void log_summary(const FrameState& frame, std::int64_t now, const Dynarmic::A32::Jit::TranslationStats& jit) {
+void log_summary(const FrameState& frame, std::int64_t now, const Dynarmic::A32::Jit::TranslationStats& jit,
+                 const Process::TranslationTotals& all) {
     log("hitch summary: %llu frames in %lld s, %llu at %lld ms or more, worst %lld ms | render thread translated "
-        "%llu blocks in %lld ms, %llu code cache flushes, cache %.1f of %.0f MiB",
+        "%llu blocks in %lld ms, %llu code cache flushes, cache %.1f of %.0f MiB | all %zu threads: %llu blocks, "
+        "code %.1f MiB",
         static_cast<unsigned long long>(frame.frames), static_cast<long long>((now - frame.summary_start_ns) / 1'000'000'000),
         static_cast<unsigned long long>(frame.hitches), ms(threshold_ns()), ms(frame.worst_ns),
         static_cast<unsigned long long>(jit.blocks - frame.summary_jit.blocks),
         ms(static_cast<std::int64_t>(jit.nanoseconds - frame.summary_jit.nanoseconds)),
         static_cast<unsigned long long>(jit.cache_flushes - frame.summary_jit.cache_flushes), mib(jit.code_used),
-        mib(jit.code_size));
+        mib(jit.code_size), all.threads, static_cast<unsigned long long>(all.stats.blocks), mib(all.stats.code_used));
+    std::string busiest;
+    for (const auto& [tid, blocks] : all.busiest) {
+        if (blocks != 0) append(busiest, " %d:%llu", static_cast<int>(tid), static_cast<unsigned long long>(blocks));
+    }
+    log("hitch summary: most blocks (tid:blocks)%s", busiest.c_str());
 }
 
 }  // namespace
 
-bool hitch_trace_enabled() {
-    return threshold_ns() != 0;
-}
+const bool detail::g_hitch_trace_enabled = threshold_ns() != 0;
 
 void HitchScope::begin(HitchWait kind, std::uint32_t id) {
     ThreadWaits& waits = t_waits;
@@ -292,7 +297,8 @@ void hitch_frame_boundary(GuestThread& thread) {
     ThreadWaits& waits = t_waits;
     const std::int64_t now = now_ns();
     const Dynarmic::A32::Jit::TranslationStats jit = thread.translation_stats();
-    const std::uint64_t all_threads_jit_ns = Process::translation_ns_all_threads();
+    const Process::TranslationTotals all = Process::translation_totals();
+    const std::uint64_t all_threads_jit_ns = all.stats.nanoseconds;
     rusage usage{};
     ::getrusage(RUSAGE_THREAD, &usage);
     SchedStat sched;
@@ -312,7 +318,7 @@ void hitch_frame_boundary(GuestThread& thread) {
             log_hitch(frame, waits, thread.tid, frame_ns, jit, all_threads_jit_ns, usage, sched, have_sched);
         }
         if (now - frame.summary_start_ns >= kSummaryIntervalNs) {
-            log_summary(frame, now, jit);
+            log_summary(frame, now, jit, all);
             frame.summary_start_ns = now;
             frame.summary_jit = jit;
             frame.frames = 0;

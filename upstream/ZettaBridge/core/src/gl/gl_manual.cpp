@@ -59,7 +59,20 @@ struct GlThreadState {
     GLuint element_array_buffer = 0;
     GLuint pixel_pack_buffer = 0;
     GLuint pixel_unpack_buffer = 0;
-    std::unordered_map<GLuint, Attribute> attributes;
+    // By index, as a vector: every draw with client arrays walks them all. GLES has a few dozen
+    // attributes at most; an index past kMaxAttributes is invalid, the driver rejects the call,
+    // and it is recorded in `untracked`, which nothing reads.
+    static constexpr GLuint kMaxAttributes = 64;
+    std::vector<Attribute> attributes;
+    Attribute untracked;
+    Attribute& attribute(GLuint index) {
+        if (index >= kMaxAttributes) return untracked;
+        if (index >= attributes.size()) attributes.resize(index + 1);
+        return attributes[index];
+    }
+    const Attribute* find_attribute(GLuint index) const {
+        return index < attributes.size() ? &attributes[index] : nullptr;
+    }
     std::unordered_map<GLuint, std::unordered_map<GLint, std::uint64_t>> uniforms;
     std::unordered_map<GLenum, std::uint32_t> strings;
     std::unordered_map<std::uint64_t, std::uint32_t> indexed_strings;
@@ -298,7 +311,8 @@ bool materialize_client_arrays(HostGl& host, HostGl::Call& call, std::uint64_t f
 
     GlThreadState& current = state(host);
     std::vector<MaterializedAttribute> materialized;
-    for (const auto& [index, attribute] : current.attributes) {
+    for (GLuint index = 0; index < current.attributes.size(); ++index) {
+        const GlThreadState::Attribute& attribute = current.attributes[index];
         if (!attribute.enabled || !attribute.defined || attribute.buffer != 0) continue;
         const std::uint64_t component = attribute_component_bytes(attribute.type);
         if (attribute.size < 1 || attribute.size > 4 || component == 0 || attribute.stride < 0) {
@@ -503,7 +517,7 @@ GLuint HostGl::pixel_buffer(bool pack) const {
 }
 
 void HostGl::note_vertex_attrib_enabled(GLuint index, bool enabled) {
-    state(*this).attributes[index].enabled = enabled;
+    state(*this).attribute(index).enabled = enabled;
 }
 
 GLint HostGl::pixel_alignment(bool pack) const {
@@ -760,7 +774,7 @@ bool zbgl_manual_glShaderSource(HostGl& host, HostGl::Call& call) {
 
 bool zbgl_manual_glVertexAttribPointer(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(0);
-    GlThreadState::Attribute& attribute = state(host).attributes[index];
+    GlThreadState::Attribute& attribute = state(host).attribute(index);
     attribute.defined = true;
     attribute.size = call.scalar<GLint>(1);
     attribute.type = call.scalar<GLenum>(2);
@@ -864,8 +878,8 @@ bool zbgl_manual_glGetVertexAttribPointerv(HostGl& host, HostGl::Call& call) {
         call.fail(kGlInvalidValue, "vertex attribute pointer output is null");
         return true;
     }
-    const auto found = state(host).attributes.find(index);
-    *pointer = found == state(host).attributes.end() ? 0 : found->second.guest_pointer;
+    const GlThreadState::Attribute* found = state(host).find_attribute(index);
+    *pointer = found == nullptr ? 0 : found->guest_pointer;
     return true;
 }
 
@@ -1319,7 +1333,7 @@ bool zbgl_manual_glDrawRangeElements(HostGl& host, HostGl::Call& call) {
 
 bool zbgl_manual_glVertexAttribIPointer(HostGl& host, HostGl::Call& call) {
     const GLuint index = call.scalar<GLuint>(0);
-    GlThreadState::Attribute& attribute = state(host).attributes[index];
+    GlThreadState::Attribute& attribute = state(host).attribute(index);
     attribute.defined = true;
     attribute.size = call.scalar<GLint>(1);
     attribute.type = call.scalar<GLenum>(2);

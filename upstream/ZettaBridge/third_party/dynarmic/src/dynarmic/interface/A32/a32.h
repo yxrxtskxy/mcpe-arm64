@@ -41,6 +41,13 @@ public:
     void ClearCache();
 
     /**
+     * Clears the code cache at once and gives back the memory behind it: the code pages and the
+     * bookkeeping of every block. Unlike ClearCache it does not wait for the next Run, so it must
+     * not be called while Run or Step executes, from any thread.
+     */
+    void ReleaseCache();
+
+    /**
      * Invalidate the code cache at a range of addresses.
      * @param start_address The starting address of the range to invalidate.
      * @param length The length (in bytes) of the range to invalidate.

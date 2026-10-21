@@ -1,6 +1,8 @@
 #include "zb/process.h"
 
 #include <elf.h>
+#include <malloc.h>
+#include <pthread.h>
 #include <sched.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
@@ -8,6 +10,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -716,14 +719,66 @@ void Process::request_profile_samples() {
     }
 }
 
-std::uint64_t Process::translation_ns_all_threads() {
+Process::TranslationTotals Process::translation_totals() {
+    TranslationTotals totals;
     Process* process = reporter_process;
-    if (process == nullptr) return 0;
-    std::uint64_t total = 0;
+    if (process == nullptr) return totals;
+    const auto add = [&totals](const GuestThread* t) {
+        const auto stats = t->translation_stats();
+        ++totals.threads;
+        totals.stats.blocks += stats.blocks;
+        totals.stats.nanoseconds += stats.nanoseconds;
+        totals.stats.cache_flushes += stats.cache_flushes;
+        totals.stats.code_used += stats.code_used;
+        totals.stats.code_size += stats.code_size;
+        auto& busiest = totals.busiest;
+        if (stats.blocks > busiest.back().second) {
+            busiest.back() = {t->tid, stats.blocks};
+            std::sort(busiest.begin(), busiest.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        }
+    };
     std::lock_guard<std::mutex> lock(process->threads_mutex_);
-    for (const GuestThread* t : process->threads_) total += t->translation_stats().nanoseconds;
-    for (const GuestThread* t : process->borrowers_) total += t->translation_stats().nanoseconds;
-    return total;
+    for (const GuestThread* t : process->threads_) add(t);
+    for (const GuestThread* t : process->borrowers_) add(t);
+    return totals;
+}
+
+void Process::start_translation_trimmer() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            pthread_setname_np(pthread_self(), "zb-trim");
+            constexpr std::int64_t kIdleNs = 120'000'000'000;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(10));
+                Process* process = reporter_process;
+                if (process == nullptr) continue;
+                const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now().time_since_epoch())
+                                             .count();
+                bool released = false;
+                {
+                    std::lock_guard<std::mutex> lock(process->threads_mutex_);
+                    const auto release = [now, &released](GuestThread* t) {
+                        if (const std::uint64_t blocks = t->release_translations_if_idle(now, kIdleNs)) {
+                            log("released the translations of idle thread %d (%llu blocks)",
+                                static_cast<int>(t->tid), static_cast<unsigned long long>(blocks));
+                            released = true;
+                        }
+                    };
+                    for (GuestThread* t : process->threads_) release(t);
+                    for (GuestThread* t : process->borrowers_) release(t);
+                }
+#if defined(M_PURGE_ALL)
+                // The allocator keeps freed pages until it decides to return them; a release
+                // frees a lot at once, so they go back now.
+                if (released) mallopt(M_PURGE_ALL, 0);
+#elif defined(M_PURGE)
+                if (released) mallopt(M_PURGE, 0);
+#endif
+            }
+        }).detach();
+    });
 }
 
 std::string Process::describe_guest_stack(std::uint32_t sp, unsigned max_entries) {

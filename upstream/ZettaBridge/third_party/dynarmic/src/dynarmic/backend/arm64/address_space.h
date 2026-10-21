@@ -8,6 +8,8 @@
 #include <atomic>
 #include <map>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <mcl/stdint.hpp>
 #include <oaknut/code_block.hpp>
@@ -43,6 +45,8 @@ public:
     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors);
 
     void ClearCache();
+    // ClearCache, and the code pages and the bookkeeping go back to the system.
+    void ReleaseCache();
 
     void DumpDisassembly() const;
 
@@ -75,7 +79,7 @@ protected:
     size_t GetRemainingSize();
     EmittedBlockInfo Emit(IR::Block ir_block);
     void Link(EmittedBlockInfo& block);
-    void LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list);
+    void LinkBlockLink(const CodePtr entry_point, const CodePtr target_ptr, BlockRelocation relocation);
     void RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr);
 
     FakeCall FastmemCallback(u64 host_pc);
@@ -103,12 +107,32 @@ protected:
     oaknut::CodeGenerator code;
     TranslationCounters translation_counters;
 
+    // What an emitted block keeps once it is linked: its links to other blocks, for relinking, and
+    // its fastmem accesses, for a fault in one. One per block translated since the last cache
+    // clear, so it is kept small: as an EmittedBlockInfo in a hash map, with a hash map of its own
+    // for each of these, it took about 2 KiB of host memory per block.
+    struct FastmemPatch {
+        u32 code_offset;      // of the access, from the entry point
+        u32 fallback_offset;  // where the fake call goes, from the entry point
+        unsigned instruction;  // the access's half of its DoNotFastmemMarker
+        bool recompile;
+    };
+    struct BlockInfo {
+        IR::LocationDescriptor location;
+        size_t size;
+        std::vector<std::pair<IR::LocationDescriptor, BlockRelocation>> block_relocations;  // by target
+        std::vector<FastmemPatch> fastmem_patches;                                           // by code_offset
+    };
+    static BlockInfo MakeBlockInfo(IR::LocationDescriptor location, const EmittedBlockInfo& emitted);
+
     // A IR::LocationDescriptor will have one current CodePtr.
     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
     tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;
-    std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
-    tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
-    tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
+    // Every block emitted since the last cache clear, by entry point.
+    std::map<CodePtr, BlockInfo> block_infos;
+    // The blocks that link to a location. A vector each: a hot function is linked to from thousands
+    // of blocks, and an unordered_multimap walks all of a key's entries on every insert.
+    tsl::robin_map<IR::LocationDescriptor, std::vector<CodePtr>> block_references;
 
     ExceptionHandler exception_handler;
     FastmemManager fastmem_manager;

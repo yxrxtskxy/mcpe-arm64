@@ -158,6 +158,9 @@ Stop GuestThread::translator_gave_up(const char* reason) {
 Stop GuestThread::run() {
     pending_ = Stop{};
     host_fpcr_ = read_fpcr();
+    // Only this thread counts its runs: no atomic add needed.
+    runs_.store(runs_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    const std::lock_guard<std::mutex> jit_lock(jit_mutex_);
     for (;;) {
         Dynarmic::HaltReason reason{};
         try {
@@ -248,6 +251,31 @@ std::optional<GuestResult> GuestThread::call(std::uint32_t target, const GuestCa
 
 void GuestThread::invalidate(std::uint32_t addr, std::uint32_t len) {
     jit_->InvalidateCacheRange(addr, len);
+}
+
+// Each guest thread translates the code it runs into its own cache, and keeps it: the Java thread
+// that loaded Minecraft PE's libraries held 138,000 blocks of start-up code, about 100 MiB of host
+// memory, long after it last ran any of it. A thread idle that long has its cache dropped, and
+// translates again what it runs next.
+std::uint64_t GuestThread::release_translations_if_idle(std::int64_t now_ns, std::int64_t idle_ns) {
+    // Not worth a release below this much code.
+    constexpr std::size_t kMinimumCode = 1024 * 1024;
+    const std::uint64_t runs = runs_.load(std::memory_order_relaxed);
+    if (runs != idle_check_runs_ || idle_since_ns_ == 0) {
+        idle_check_runs_ = runs;
+        idle_since_ns_ = now_ns;
+        return 0;
+    }
+    if (now_ns - idle_since_ns_ < idle_ns) return 0;
+    const auto stats = jit_->GetTranslationStats();
+    if (stats.code_used < kMinimumCode) return 0;
+    std::unique_lock<std::mutex> lock(jit_mutex_, std::try_to_lock);
+    // run() counts before it locks: a thread on its way in is not idle.
+    if (!lock.owns_lock() || runs_.load(std::memory_order_relaxed) != runs) return 0;
+    jit_->ReleaseCache();
+    const std::uint64_t released = stats.blocks - blocks_at_release_;
+    blocks_at_release_ = stats.blocks;
+    return released;
 }
 
 void GuestThread::begin_blocking() {

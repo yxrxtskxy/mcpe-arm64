@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <mcl/bit_cast.hpp>
 
@@ -76,16 +78,16 @@ CodePtr AddressSpace::Get(IR::LocationDescriptor descriptor) {
 }
 
 std::optional<IR::LocationDescriptor> AddressSpace::ReverseGetLocation(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
+    if (auto iter = block_infos.upper_bound(host_pc); iter != block_infos.begin()) {
         // upper_bound locates the first value greater than host_pc, so we need to decrement
         --iter;
-        return iter->second;
+        return iter->second.location;
     }
     return std::nullopt;
 }
 
 CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
-    if (auto iter = reverse_block_entries.upper_bound(host_pc); iter != reverse_block_entries.begin()) {
+    if (auto iter = block_infos.upper_bound(host_pc); iter != block_infos.begin()) {
         // upper_bound locates the first value greater than host_pc, so we need to decrement
         --iter;
         return iter->first;
@@ -137,12 +139,26 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 void AddressSpace::ClearCache() {
     ClearFastDispatchTable();
     block_entries.clear();
-    reverse_block_entries.clear();
     block_infos.clear();
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
     translation_counters.cache_flushes.fetch_add(1, std::memory_order_relaxed);
     translation_counters.code_used.store(static_cast<size_t>(code.offset()), std::memory_order_relaxed);
+}
+
+void AddressSpace::ReleaseCache() {
+    const auto used_end = reinterpret_cast<std::uintptr_t>(mem.ptr()) + static_cast<std::uintptr_t>(code.offset());
+    ClearCache();
+    // clear() keeps the hash maps' buckets; fresh maps do not.
+    block_entries = {};
+    block_infos = {};
+    block_references = {};
+
+    const auto page = static_cast<std::uintptr_t>(getpagesize());
+    const auto first_free = (reinterpret_cast<std::uintptr_t>(mem.ptr()) + static_cast<std::uintptr_t>(prelude_info.end_of_prelude) + page - 1) & ~(page - 1);
+    if (used_end > first_free) {
+        madvise(reinterpret_cast<void*>(first_free), used_end - first_free, MADV_DONTNEED);
+    }
 }
 
 void AddressSpace::DumpDisassembly() const {
@@ -165,8 +181,7 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
 
     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
-    ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
-    ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
+    ASSERT(block_infos.emplace(block_info.entry_point, MakeBlockInfo(block.Location(), block_info)).second);
 
     Link(block_info);
     RelinkForDescriptor(block.Location(), block_info.entry_point);
@@ -313,51 +328,93 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
         }
     }
 
-    for (auto [target_descriptor, list] : block_info.block_relocations) {
-        block_references[target_descriptor].insert(block_info.entry_point);
-        LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
-    }
-}
-
-void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr target_ptr, const std::vector<BlockRelocation>& block_relocations_list) {
-    using namespace oaknut;
-    using namespace oaknut::util;
-
-    for (auto [ptr_offset, type] : block_relocations_list) {
-        CodeGenerator c{mem.ptr(), mem.ptr()};
-        c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
-
-        switch (type) {
-        case BlockRelocationType::Branch:
-            if (target_ptr) {
-                c.B((void*)target_ptr);
-            } else {
-                c.NOP();
-            }
-            break;
-        case BlockRelocationType::MoveToScratch1:
-            if (target_ptr) {
-                c.ADRL(Xscratch1, (void*)target_ptr);
-            } else {
-                c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
-            }
-            break;
-        default:
-            ASSERT_FALSE("Invalid BlockRelocationType");
+    for (const auto& [target_descriptor, list] : block_info.block_relocations) {
+        block_references[target_descriptor].push_back(block_info.entry_point);
+        const CodePtr target_ptr = Get(target_descriptor);
+        for (const BlockRelocation relocation : list) {
+            LinkBlockLink(block_info.entry_point, target_ptr, relocation);
         }
     }
 }
 
-void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
-    for (auto code_ptr : block_references[target_descriptor]) {
-        if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
-            const EmittedBlockInfo& block_info = block_iter->second;
+AddressSpace::BlockInfo AddressSpace::MakeBlockInfo(IR::LocationDescriptor location, const EmittedBlockInfo& emitted) {
+    BlockInfo info{location, emitted.size, {}, {}};
 
-            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor); relocation_iter != block_info.block_relocations.end()) {
-                LinkBlockLinks(block_info.entry_point, target_ptr, relocation_iter->second);
+    info.block_relocations.reserve([&] {
+        size_t count = 0;
+        for (const auto& entry : emitted.block_relocations) {
+            count += entry.second.size();
+        }
+        return count;
+    }());
+    for (const auto& [target, list] : emitted.block_relocations) {
+        for (const BlockRelocation relocation : list) {
+            info.block_relocations.emplace_back(target, relocation);
+        }
+    }
+    std::sort(info.block_relocations.begin(), info.block_relocations.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    info.fastmem_patches.reserve(emitted.fastmem_patch_info.size());
+    for (const auto& [code_offset, patch] : emitted.fastmem_patch_info) {
+        ASSERT(std::get<0>(patch.marker) == location);
+        info.fastmem_patches.push_back(FastmemPatch{
+            .code_offset = static_cast<u32>(code_offset),
+            .fallback_offset = static_cast<u32>(mcl::bit_cast<CodePtr>(patch.fc.call_pc) - emitted.entry_point),
+            .instruction = std::get<1>(patch.marker),
+            .recompile = patch.recompile,
+        });
+    }
+    std::sort(info.fastmem_patches.begin(), info.fastmem_patches.end(),
+              [](const FastmemPatch& a, const FastmemPatch& b) { return a.code_offset < b.code_offset; });
+
+    return info;
+}
+
+void AddressSpace::LinkBlockLink(const CodePtr entry_point, const CodePtr target_ptr, BlockRelocation relocation) {
+    using namespace oaknut;
+    using namespace oaknut::util;
+
+    CodeGenerator c{mem.ptr(), mem.ptr()};
+    c.set_xptr(reinterpret_cast<u32*>(entry_point + relocation.code_offset));
+
+    switch (relocation.type) {
+    case BlockRelocationType::Branch:
+        if (target_ptr) {
+            c.B((void*)target_ptr);
+        } else {
+            c.NOP();
+        }
+        break;
+    case BlockRelocationType::MoveToScratch1:
+        if (target_ptr) {
+            c.ADRL(Xscratch1, (void*)target_ptr);
+        } else {
+            c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
+        }
+        break;
+    default:
+        ASSERT_FALSE("Invalid BlockRelocationType");
+    }
+}
+
+void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
+    const auto references = block_references.find(target_descriptor);
+    if (references == block_references.end()) {
+        return;
+    }
+    for (const CodePtr entry_point : references->second) {
+        if (auto block_iter = block_infos.find(entry_point); block_iter != block_infos.end()) {
+            const BlockInfo& block_info = block_iter->second;
+
+            const auto by_target = [](const auto& entry, IR::LocationDescriptor target) { return entry.first < target; };
+            for (auto relocation = std::lower_bound(block_info.block_relocations.begin(), block_info.block_relocations.end(), target_descriptor, by_target);
+                 relocation != block_info.block_relocations.end() && relocation->first == target_descriptor;
+                 ++relocation) {
+                LinkBlockLink(entry_point, target_ptr, relocation->second);
             }
 
-            mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+            mem.invalidate(reinterpret_cast<u32*>(entry_point), block_info.size);
         }
     }
 }
@@ -366,27 +423,28 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
     {
         const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
 
-        const auto entry_point = ReverseGetEntryPoint(host_ptr);
-        if (!entry_point) {
+        auto block_info = block_infos.upper_bound(host_ptr);
+        if (block_info == block_infos.begin()) {
+            goto fail;
+        }
+        --block_info;
+        const CodePtr entry_point = block_info->first;
+        const BlockInfo& info = block_info->second;
+
+        const auto code_offset = static_cast<u32>(host_ptr - entry_point);
+        const auto patch_entry = std::lower_bound(info.fastmem_patches.begin(), info.fastmem_patches.end(), code_offset,
+                                                  [](const FastmemPatch& patch, u32 offset) { return patch.code_offset < offset; });
+        if (patch_entry == info.fastmem_patches.end() || patch_entry->code_offset != code_offset) {
             goto fail;
         }
 
-        const auto block_info = block_infos.find(entry_point);
-        if (block_info == block_infos.end()) {
-            goto fail;
-        }
+        const FakeCall fc{
+            .call_pc = mcl::bit_cast<u64>(entry_point + patch_entry->fallback_offset),
+        };
 
-        const auto patch_entry = block_info->second.fastmem_patch_info.find(host_ptr - entry_point);
-        if (patch_entry == block_info->second.fastmem_patch_info.end()) {
-            goto fail;
-        }
-
-        const auto fc = patch_entry->second.fc;
-
-        if (patch_entry->second.recompile) {
-            const auto marker = patch_entry->second.marker;
-            fastmem_manager.MarkDoNotFastmem(marker);
-            InvalidateBasicBlocks({std::get<0>(marker)});
+        if (patch_entry->recompile) {
+            fastmem_manager.MarkDoNotFastmem(std::make_tuple(info.location, patch_entry->instruction));
+            InvalidateBasicBlocks({info.location});
         }
 
         return fc;

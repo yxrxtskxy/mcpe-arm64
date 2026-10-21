@@ -66,6 +66,14 @@ struct Jit::Impl final {
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
+    void ReleaseCache() {
+        ASSERT(!jit_interface->is_executing);
+        std::unique_lock lock{invalidation_mutex};
+        invalidate_entire_cache = false;
+        invalid_cache_ranges.clear();
+        current_address_space.ReleaseCache();
+    }
+
     void InvalidateCacheRange(std::uint32_t start_address, std::size_t length) {
         std::unique_lock lock{invalidation_mutex};
         invalid_cache_ranges.add(boost::icl::discrete_interval<u32>::closed(start_address, static_cast<u32>(start_address + length - 1)));
@@ -189,6 +197,10 @@ HaltReason Jit::Step() {
 
 void Jit::ClearCache() {
     impl->ClearCache();
+}
+
+void Jit::ReleaseCache() {
+    impl->ReleaseCache();
 }
 
 void Jit::InvalidateCacheRange(std::uint32_t start_address, std::size_t length) {

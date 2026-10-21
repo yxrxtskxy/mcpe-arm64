@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include <dynarmic/interface/A32/a32.h>
@@ -108,6 +109,10 @@ public:
     void invalidate(std::uint32_t addr, std::uint32_t len);
     // What this thread's JIT has translated so far (hitch_trace.h). Safe from any thread.
     Dynarmic::A32::Jit::TranslationStats translation_stats() const { return jit_->GetTranslationStats(); }
+    // Drops this thread's translations and gives their memory back once it has not entered
+    // translated code for idle_ns. Call it periodically, always from the same thread (it keeps the
+    // idle timing); it never waits for the guest thread. Returns the blocks released, or 0.
+    std::uint64_t release_translations_if_idle(std::int64_t now_ns, std::int64_t idle_ns);
     // See InlineHostCalls. Set before the thread first runs; null stops for every svc.
     void set_inline_host_calls(InlineHostCalls* calls) { inline_calls_ = calls; }
     // True inside a host call served from CallSVC, i.e. with Dynarmic running.
@@ -208,6 +213,13 @@ private:
     std::uint32_t tpidrurw_ = 0;
     std::shared_ptr<Cp15> cp15_;
     std::unique_ptr<Dynarmic::A32::Jit> jit_;
+    // Held while the JIT runs; release_translations_if_idle only tries it.
+    std::mutex jit_mutex_;
+    std::atomic<std::uint64_t> runs_{0};
+    // release_translations_if_idle's own bookkeeping, only touched by its caller.
+    std::uint64_t idle_check_runs_ = 0;
+    std::int64_t idle_since_ns_ = 0;
+    std::uint64_t blocks_at_release_ = 0;
     Stop pending_;
     std::atomic<std::uint64_t> pending_signals_{0};
     std::array<g::siginfo32, 65> pending_info_{};

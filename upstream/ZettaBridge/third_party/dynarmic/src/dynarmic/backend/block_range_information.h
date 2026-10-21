@@ -5,9 +5,9 @@
 
 #pragma once
 
-#include <set>
+#include <map>
+#include <utility>
 
-#include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
 #include <tsl/robin_set.h>
 
@@ -20,10 +20,16 @@ class BlockRangeInformation {
 public:
     void AddRange(boost::icl::discrete_interval<ProgramCounterType> range, IR::LocationDescriptor location);
     void ClearCache();
+    // The blocks that overlap the ranges. Their entries are removed: a block translated again
+    // adds its range again.
     tsl::robin_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<ProgramCounterType>& ranges);
 
 private:
-    boost::icl::interval_map<ProgramCounterType, std::set<IR::LocationDescriptor>> block_ranges;
+    // Each block by the first address it covers, with the last one. No block spans more than
+    // max_span, so the blocks that overlap an address start at most that far below it. An
+    // interval_map with a std::set per segment cost about 150 bytes of host memory per block.
+    std::multimap<ProgramCounterType, std::pair<ProgramCounterType, IR::LocationDescriptor>> block_ranges;
+    ProgramCounterType max_span = 0;
 };
 
 }  // namespace Dynarmic::Backend

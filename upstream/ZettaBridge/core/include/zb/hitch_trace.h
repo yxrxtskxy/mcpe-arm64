@@ -13,7 +13,13 @@ class GuestThread;
 // longest single wait. What is left was spent running translated code or not running at all, and
 // the line has the scheduler's numbers for the thread too. Every 30 s a summary line follows.
 // Off, it costs one test per syscall and host call.
-bool hitch_trace_enabled();
+namespace detail {
+// Read once, when the library loads.
+extern const bool g_hitch_trace_enabled;
+}  // namespace detail
+inline bool hitch_trace_enabled() {
+    return detail::g_hitch_trace_enabled;
+}
 
 enum class HitchWait : std::uint8_t { Syscall, HostCall, SpinWait };
 

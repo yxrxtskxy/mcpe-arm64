@@ -236,8 +236,12 @@ void RuntimeReport::note_signal_restart(std::uint32_t nr, const char* name,
 
 void RuntimeReport::note_gl_call(const char* function, std::uint64_t host_tid) {
     // Every GL call of the game lands here, thousands per frame: only the first one takes the
-    // lock and tells the observer. Later counts reach the file with the next write.
-    if (gl_call_total_.fetch_add(1, std::memory_order_relaxed) != 0) return;
+    // lock and tells the observer. Later counts reach the file with the next write. A load and a
+    // store, not an atomic add, which took 1% of the CPU: GL calls come from the one thread that
+    // holds the context, and a count lost to a second one would only make the report low.
+    const std::uint64_t previous = gl_call_total_.load(std::memory_order_relaxed);
+    gl_call_total_.store(previous + 1, std::memory_order_relaxed);
+    if (previous != 0) return;
     std::shared_ptr<Observer> observer;
     {
         std::lock_guard<std::mutex> lock(mutex_);

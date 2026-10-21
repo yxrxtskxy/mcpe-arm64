@@ -190,6 +190,11 @@ void A32AddressSpace::InvalidateCacheRanges(const boost::icl::interval_set<u32>&
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }
 
+void A32AddressSpace::ReleaseCache() {
+    AddressSpace::ReleaseCache();
+    block_ranges.ClearCache();
+}
+
 void A32AddressSpace::EmitPrelude() {
     using namespace oaknut::util;
 

@@ -128,6 +128,20 @@ In `upstream/ZettaBridge`.
     waited up to a second at a time for one of the six cores an app gets. On its first
     `eglSwapBuffers` it now goes to -16 (`setprop debug.zb.render_nice <n>` overrides it, 0 leaves
     it alone). Threads it creates afterwards start at its old priority.
+- **Less memory** (numbers under Status).
+  - *Translations of idle threads are released.* Each guest thread translates the code it runs into
+    its own cache and used to keep it for good. The Java thread that loaded the game's libraries
+    held 138,000 blocks of start-up code, and the chunk workers about 20,000 each. A thread that
+    has not run translated code for two minutes now has its cache dropped (`zb-trim` thread,
+    `Jit::ReleaseCache`), and the allocator returns the freed pages (`M_PURGE_ALL`). A thread
+    that runs again translates what it needs.
+  - The translator's per-block bookkeeping is a third of what it was (see Changes to Dynarmic).
+- **Cheaper host calls.** The game makes 5,000–9,000 GL calls a frame, and each one paid for
+  bookkeeping. A sampled profile showed 1.9% of the CPU in atomic adds on counters only one
+  thread writes, and 1.1% in the dynamic TLS resolver (`libzbridge.so` is `dlopen`ed, so every
+  `thread_local` is a call). Those counters now use plain stores. The activity slot is one
+  thread-local lookup instead of four, plus a table scan. Vertex attributes are a vector, not a
+  hash map.
 - Diagnostics: per-thread activity dumps, `setprop debug.zb.profile 1` (the busiest guest threads
   with their hottest blocks in logcat every 10 s) and `setprop debug.zb.strace net|all`.
 - **Freeze tracer**, `setprop debug.zb.hitch <ms>` (`hitch_trace.cpp`), read when the game starts.
@@ -137,7 +151,8 @@ In `upstream/ZettaBridge`.
     its Java method.
   - What is left is guest code. The line also has the thread's time on and off the CPU, its page
     faults and context switches.
-  - A `hitch summary:` line follows every 30 s, with how full the render thread's code cache is.
+  - A `hitch summary:` line follows every 30 s. It says how full the render thread's code cache
+    is, and how many blocks all threads hold between them, with the busiest threads.
   - With the profiler on as well, each logged frame names its hottest guest addresses.
   - Off, it costs one test per syscall and host call.
 - `PluginStore.importApk(Context, InputStream)` for the bundled APK, and a Windows path fix in
@@ -170,6 +185,23 @@ In `upstream/ZettaBridge/third_party/dynarmic`, on top of ZettaBridge's own two 
     unnoticed, as with any compare-and-swap.
   - The default stays as it was. It cannot be combined with `fastmem_exclusive_access`, whose
     inline x86_64 code takes the lock.
+- **Compact block bookkeeping (arm64).** Every translated block used to keep its
+  `EmittedBlockInfo`, stored by value in a hash map, with two hash maps of its own: one for
+  relinking, one for fastmem faults. Each target also got a hash set of the blocks linking to it,
+  and an interval map held a `std::set` per segment. That came to about 1.9 KB of host heap per
+  block, and Minecraft PE's 63 threads hold some 630,000 blocks.
+  - Now each block keeps one entry in an ordered map by entry point. The entry holds its
+    location, size, a sorted vector of block links and a sorted vector of 16-byte fastmem
+    entries. The same map answers the reverse lookups.
+  - The blocks linking to a target are a vector in one hash map. An `unordered_multimap` there
+    doubled the time to load the game's libraries: libc++ walks all of a key's entries on each
+    insert, and hot functions are linked to from thousands of blocks.
+  - `BlockRangeInformation` (both backends) is an ordered multimap by first address with the
+    longest block span. It also removes the entries it invalidates.
+  - The result is about 0.55 KB per block, and library loading is slightly faster than before.
+- **`Jit::ReleaseCache()`.** It clears the code cache at once, outside `Run`, and gives the
+  memory back: the code pages through `madvise(MADV_DONTNEED)`, the fast-dispatch table and the
+  bookkeeping.
 
 ## Building (Windows + WSL)
 
@@ -248,6 +280,30 @@ sh tools/wsl_build_host_x64.sh && sh tests/run_mcpe_dlopen.sh
     The lock-free exclusive monitor makes nearly all of the difference. The render thread's
     priority halves what is left. A 2.5-minute flight afterwards had 3 frames over 100 ms, the
     longest 134 ms.
+  - Memory of the game's process (PSS, `dumpsys meminfo`), standing in the same world at a long
+    view distance:
+
+    | | 1.1.5-arm64.3 | 1.1.5-arm64.4 |
+    |---|---|---|
+    | Just after the world loaded | 1,845 MB (native heap 1,184 MB) | 1,040–1,120 MB |
+    | Three minutes later | not measured | 880–1,000 MB |
+    | Game libraries load in | 3.0–3.3 s | 2.8–3.2 s |
+
+    In the same 30 s, both translate about 635,000 blocks across 63 threads. The second row comes
+    from releasing idle threads' translations. Moving again afterwards made no new freezes: the
+    workers translate their code again on their own threads.
+  - CPU, the whole app standing still at about 110 fps (`simpleperf`):
+
+    | Where | Share |
+    |---|---|
+    | Translated game code | 73% |
+    | FMOD, translated | 4% |
+    | Adreno GL driver | 11% |
+    | `libzbridge.so` | 7% |
+
+    The GPU load is the game's own rendering. On a 60 Hz display, or with the phone's refresh rate
+    left on automatic, the game draws 60 frames a second and uses about half the CPU and a third
+    of the GPU.
 - First launch after each install or update spends a few seconds importing the bundled game; the
   game's data directory (worlds, options) is kept.
 - Untested: Xbox Live sign-in, multiplayer and Realms, the Store, long sessions. ZettaBridge itself is
