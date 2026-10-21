@@ -101,7 +101,9 @@ public class GameLauncherActivity extends Activity {
 
     private void launch() {
         startActivity(PluginSwitchActivity.intent(this, packageName));
-        finish();
+        // The game runs in a task of its own (:guest). Plain finish() would leave this task in
+        // Recents as a second, empty window of the app.
+        finishAndRemoveTask();
         overridePendingTransition(0, 0);
     }
 
