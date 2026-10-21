@@ -94,11 +94,13 @@ public:
         return false;
     }
 
-    // Redirects guest file operations under one directory to another. Default: nothing, for an
+    // Redirects guest file operations under one directory to another; java: paths the guest hands
+    // to Java under it are rewritten too (Process::add_path_alias). Default: nothing, for an
     // engine with no guest runtime behind it.
-    virtual void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix) {
+    virtual void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix, bool java) {
         (void)guest_prefix;
         (void)host_prefix;
+        (void)java;
     }
 };
 
@@ -193,7 +195,7 @@ public:
     bool bind_class_loader(JniBackend::Env env, JniBackend::Ref loader, std::string& error) override;
     bool start(const LibraryRuntimeOptions& options, std::string& error) override;
     JniLoadReport load(JniBackend::Env env, const std::string& guest_library) override;
-    void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix) override;
+    void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix, bool java) override;
     bool create_native_activity(JniBackend::Env env, std::uint64_t activity, const void* saved_state,
                                 std::size_t saved_state_size, std::uint32_t guest_library,
                                 std::string& error) override;

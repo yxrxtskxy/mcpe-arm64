@@ -60,6 +60,27 @@ int main() {
     CHECK(process.translate_path("/data/data/com.example/files/thing.ttf") ==
           std::string("/data/data/com.example/files/thing.ttf"));
 
+    // Paths the guest hands to Java are rewritten only under a java alias: a directory that
+    // exists only in the guest's view. Minecraft PE stores custom.png through its own file calls
+    // and reads it back through Java's FileInputStream, which must see the same file.
+    const std::string data = "/data/user/0/app/files/plugins/com.example/data";
+    process.add_path_alias("/data/data/com.example", data, true);
+    CHECK(process.translate_path("/data/data/com.example/games/custom.png") == data + "/games/custom.png");
+    CHECK(process.java_path("/data/data/com.example/games/custom.png") == data + "/games/custom.png");
+    CHECK(process.java_path("/data/data/com.example") == data);
+    // A sibling that only starts with the same characters is untouched.
+    CHECK(process.java_path("/data/data/com.example2/x") == std::string("/data/data/com.example2/x"));
+    // The proxy directory exists for Java too, which loads the proxy libraries from it.
+    CHECK(process.java_path("/data/user/0/app/files/plugins/com.example/proxy/libil2cpp.so") ==
+          std::string("/data/user/0/app/files/plugins/com.example/proxy/libil2cpp.so"));
+    // The longest alias decides, java or not.
+    process.add_path_alias("/data/data/com.example/cache", "/tmp/cache");
+    CHECK(process.translate_path("/data/data/com.example/cache/x") == std::string("/tmp/cache/x"));
+    CHECK(process.java_path("/data/data/com.example/cache/x") == std::string("/data/data/com.example/cache/x"));
+    // Strings that are not absolute paths pass through.
+    CHECK(process.java_path("data/data/com.example") == std::string("data/data/com.example"));
+    CHECK(process.java_path("").empty());
+
     fs::remove_all(root);
     std::puts("path_translation_test PASS");
     return 0;

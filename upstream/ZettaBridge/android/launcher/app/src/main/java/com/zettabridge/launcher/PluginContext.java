@@ -155,6 +155,23 @@ final class PluginContext extends ContextWrapper {
         getTheme().applyStyle(resid, true);
     }
 
+    // Storage permissions of apps built before scoped storage: granted while the host has "All
+    // files access", which covers everything they stood for (StorageAccessActivity).
+    @Override
+    public int checkPermission(String permission, int pid, int uid) {
+        if (pid == android.os.Process.myPid() && uid == android.os.Process.myUid()
+                && StorageAccessActivity.grants(permission)) {
+            return PackageManager.PERMISSION_GRANTED;
+        }
+        return super.checkPermission(permission, pid, uid);
+    }
+
+    @Override
+    public int checkSelfPermission(String permission) {
+        if (StorageAccessActivity.grants(permission)) return PackageManager.PERMISSION_GRANTED;
+        return super.checkSelfPermission(permission);
+    }
+
     @Override
     public Object getSystemService(String name) {
         if (LAYOUT_INFLATER_SERVICE.equals(name)) {

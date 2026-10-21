@@ -24,16 +24,22 @@ MinecraftPE-1.1.5-arm64.apk  (package com.yxrxtskxy.mcpe.arm64, lib/arm64-v8a on
 
 At first launch the game APK is copied into the app's private storage, and its two arm32
 libraries are extracted and fixed up for the modern linker. After that every launch goes straight
-into the game. Worlds live in the app's private storage (scoped storage blocks
-`/sdcard/games/com.mojang` on Android 11+). Uninstalling the app deletes them.
+into the game.
+
+**Where worlds live.** By default, the game keeps its worlds in the app's private storage, and
+uninstalling the app deletes them. The game's "File Storage Location" setting, set to External,
+uses `/storage/emulated/0/games/com.mojang` instead, the folder every Minecraft PE version uses. This
+needs "All files access": the first time you switch, the app opens that settings page. Once you
+allow it, the switch sticks. Without it the game switches back to Application.
+(`StorageAccessActivity`; the app requests `MANAGE_EXTERNAL_STORAGE`, because Android 11+ never
+grants the old storage permission to it.)
 
 **Custom skins.** "Choose New Skin" opens the system file picker. The launcher copies the chosen
 image into its cache and gives the game that copy's path (`ImagePickActivity`,
-`PickedImageProvider`). The game used to ask for `WRITE_EXTERNAL_STORAGE` first, which this app
-cannot be granted on Android 11+, and then opened nothing. After each import, `GamePatches.java`
-changes one byte in `libminecraftpe.so`, so the skin picker opens without that permission. The
-world storage location still needs the permission. The change is only applied if the function's
-bytes match this build of the game exactly.
+`PickedImageProvider`). The game used to ask for storage permission first, because it opened the
+picked file by its own path. After each import, `GamePatches.java` changes two instructions in
+`libminecraftpe.so`, so the skin picker no longer asks. The change is only applied if the
+function's bytes match this build of the game exactly.
 
 ## Layout
 
@@ -75,13 +81,24 @@ In `upstream/ZettaBridge`.
   - `AInputQueue_attachLooper` reading its 5th argument from the stack.
   - `fcntl` record locks for LevelDB's `LOCK` file.
   - `SIOCGIF*` ioctls.
-  - `/data/data/<game package>` aliased to the plugin's data directory.
+  - `/data/data/<game package>` aliased to the plugin's data directory. Paths under it that the
+    game hands to Java (`NewStringUTF`) are rewritten to the real directory, because the game
+    reads some files back through Java. Its custom skin, `custom.png`, used to come back empty:
+    black, and then rejected.
+  - DNS through netd. The guest's bionic gets its resolver socket from `libnetd_client.so`, and
+    an arm64-only phone has no arm32 copy, so every name lookup fell back to `0.0.0.0:53` and
+    failed ("Invalid IP address!" for any server name). A guest `libnetd_client.so`
+    (`guest/compat/netd_client.c`) provides only the `/dev/socket/dnsproxyd` connection.
 - **Launcher.**
   - `org.apache.http.legacy` and `android.test.base` on the plugin class path, as the platform
     gives apps with an old targetSdk.
   - `RECEIVER_EXPORTED` added for those apps.
   - `Resources.getIdentifier` mapping the host package to the game's.
   - `ANativeActivity_onCreate` finding `ZBridge` from any thread.
+  - Storage permission requests (`READ`/`WRITE_EXTERNAL_STORAGE`) are answered through "All files
+    access" when the host declares `MANAGE_EXTERNAL_STORAGE`. `StorageAccessActivity` opens its
+    settings page and returns the user's answer. The plugin context reports both permissions as
+    granted while access is allowed.
   - Image picks (`ACTION_PICK` on images) open the system file picker through `ImagePickActivity`.
     The result is a private copy whose MediaStore `_data` column is a readable path
     (`PickedImageProvider`). Old apps open that path themselves. Under scoped storage the original

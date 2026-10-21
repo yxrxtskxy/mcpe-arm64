@@ -10,6 +10,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -139,7 +140,14 @@ public:
     // files it stands for live elsewhere. Without this, a guest that opens a file next to "its
     // own" library finds the proxy directory, which holds no arm32 anything: IL2CPP reports that
     // it cannot load. Aliases win over the sysroot mappings, and the longest prefix wins.
-    void add_path_alias(std::string guest_prefix, std::string host_prefix);
+    // java: the guest prefix names a directory that exists only in the guest's view
+    // ("/data/data/<package>"), so java_path rewrites paths under it too. The proxy directory
+    // is not one: it exists for Java, which needs the proxy libraries in it.
+    void add_path_alias(std::string guest_prefix, std::string host_prefix, bool java = false);
+    // A path the guest hands to Java (NewStringUTF), rewritten when the alias that matches it is
+    // a java one; anything else unchanged. Java opens such paths itself: Minecraft PE reads its
+    // custom skin back through FileInputStream, which knows nothing of the guest's aliases.
+    std::string java_path(std::string_view guest_path) const;
 
     // Distinct paths of the files the guest currently has mapped, newest first. A library the
     // guest loaded by itself (a JNI shim whose JNI_OnLoad dlopens the real library, which Unity
@@ -248,8 +256,15 @@ private:
     std::set<std::uint64_t> seen_;
     std::vector<FileMapping> file_mappings_;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> textrel_ranges_;
+    struct PathAlias {
+        std::string guest_prefix;
+        std::string host_prefix;
+        bool java = false;
+    };
+    // The longest alias that matches path, or null. path_aliases_mutex_ must be held.
+    const PathAlias* match_alias(std::string_view path) const;
     mutable std::mutex path_aliases_mutex_;
-    std::vector<std::pair<std::string, std::string>> path_aliases_;
+    std::vector<PathAlias> path_aliases_;
     static Process* reporter_process;  // for the terminate handler, which has no other way in
     std::string sysroot_;
     std::string exe_path_;

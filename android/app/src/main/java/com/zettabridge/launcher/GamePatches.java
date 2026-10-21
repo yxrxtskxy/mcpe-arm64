@@ -20,46 +20,64 @@ final class GamePatches {
     private static final String TAG = "mcpe-arm64";
     private static final String LIBRARY = "libminecraftpe.so";
 
-    // Custom skins. "Choose New Skin" first asks for WRITE_EXTERNAL_STORAGE, because the game then
-    // opens the picked image by its path, and the native answer handler
-    // nativeStoragePermissionRequestResult(granted, reason) opens the picker only when granted.
-    // From Android 11 on, this app cannot be granted that permission, so the button did nothing.
-    // The launcher now hands the game a private copy of the picked image (ImagePickActivity), so
-    // the handler's jump table sends reason 0 (custom skin) where reason 1 (import, which goes
-    // ahead either way) goes. Reason 2, the world storage location, still needs the grant.
+    // Custom skins. "Choose New Skin" first asks for storage permission, because the game then
+    // opened the picked image by its path, and picks only once the permission is granted. The
+    // launcher hands the game a private copy of the image (ImagePickActivity), so the permission
+    // is not needed; and asking for it would now open the "All files access" settings page
+    // (StorageAccessActivity) on every pick. So MinecraftScreenModel::pickCustomSkin queues the
+    // pick on the main thread directly: AppPlatform::queueForMainThread (vtable 0x120) in place of
+    // openStoragePermissionRequest (vtable 0xa0), with the same std::function. The storage
+    // location and imports still ask.
     private static final String SKIN_FUNCTION =
-            "Java_com_mojang_minecraftpe_MainActivity_nativeStoragePermissionRequestResult";
-    private static final byte[] SKIN_ORIGINAL = bytes(
-            0x80, 0xb5,              // push {r7, lr}
-            0x03, 0x2b,              // cmp r3, #3
-            0x88, 0xbf, 0x80, 0xbd,  // it hi; pophi {r7, pc}
-            0xdf, 0xe8, 0x03, 0xf0,  // tbb [pc, r3]
-            0x02, 0x03, 0x0b, 0x02,  // reason 0 -> cbz, 1 -> blx, 2 -> storage location, 3 -> cbz
-            0x92, 0xb1,              // cbz r2, <return>
-            0xea, 0xf7, 0x96, 0xe0,  // blx AppPlatform::singleton
-            0x01, 0x68,              // ldr r1, [r0]
-            0xd1, 0xf8, 0xb8, 0x10,  // ldr.w r1, [r1, #0xb8]  runStoragePermissionResultCallback
-            0xbd, 0xe8, 0x80, 0x40,  // pop.w {r7, lr}
-            0x08, 0x47);             // bx r1
-    private static final int SKIN_REASON_0 = 12;
-    private static final byte SKIN_REASON_0_PATCHED = 0x03;
+            "_ZNK20MinecraftScreenModel14pickCustomSkinESt8functionIFvN14SkinRepository20PickCustomSkinResultEEE";
+    // From the function's start through the call:
+    //   +0x00 push.w {r4-r9, lr}; ...; blx AppPlatform::singleton; mov r4, r0
+    //   +0x16 ldr.w r8, [r0, #0xa0]      openStoragePermissionRequest(reason, std::function<void()>)
+    //   ...   builds the std::function at sp+0x14
+    //   +0x66 add r2, sp, #0x14; mov r0, r4
+    //   +0x6a movs r1, #0                 reason 0, custom skin
+    //   +0x6c blx r8
+    private static final byte[] SKIN_ORIGINAL = hex(
+            "2de9f04389b00e4605464ef752e40446"
+            + "4ff000092068d0f8a080cdf80890b368"
+            + "43b16846314602229847f7680397b668"
+            + "029600e00026ed680495cdf81c901420"
+            + "4ef782e3dff88cc0dde90031224afc44"
+            + "c0e90031002102917a44c0e902670561"
+            + "0590cde9072c05aa20460021c047");
+    private static final Edit[] SKIN_EDITS = {
+        new Edit(0x16, hex("d0f82081")),  // ldr.w r8, [r0, #0x120]   queueForMainThread(std::function<void()>)
+        new Edit(0x6a, hex("1146")),      // mov r1, r2                 the std::function
+    };
 
     private GamePatches() {}
+
+    /** Bytes written at an offset into a function. */
+    private static final class Edit {
+        final int offset;
+        final byte[] bytes;
+
+        Edit(int offset, byte[] bytes) {
+            this.offset = offset;
+            this.bytes = bytes;
+        }
+    }
 
     /** Applies the fixes to the imported game's libraries; one that does not apply is logged. */
     static void apply(File libDir) {
         File library = new File(libDir, LIBRARY);
         try {
-            String result = patch(library, SKIN_FUNCTION, SKIN_ORIGINAL, SKIN_REASON_0, SKIN_REASON_0_PATCHED);
+            String result = patch(library, SKIN_FUNCTION, SKIN_ORIGINAL, SKIN_EDITS);
             Log.i(TAG, "custom skin picker: " + result);
         } catch (IOException | RuntimeException e) {
             Log.w(TAG, "custom skin picker: cannot patch " + library, e);
         }
     }
 
-    /** Writes value at function + offset when the function starts with expected. */
-    private static String patch(File library, String function, byte[] expected, int offset, byte value)
-            throws IOException {
+    /** Applies edits to a function when its bytes start with expected. */
+    private static String patch(File library, String function, byte[] expected, Edit[] edits) throws IOException {
+        byte[] patched = expected.clone();
+        for (Edit edit : edits) System.arraycopy(edit.bytes, 0, patched, edit.offset, edit.bytes.length);
         // Imported libraries are read-only (PluginFiles.extractLibraries).
         if (!library.setWritable(true, true)) throw new IOException("cannot make " + library + " writable");
         try (RandomAccessFile file = new RandomAccessFile(library, "rw")) {
@@ -67,16 +85,16 @@ final class GamePatches {
             elf.order(ByteOrder.LITTLE_ENDIAN);
             int at = symbolOffset(elf, function);
             if (at < 0 || at + expected.length > elf.limit()) return function + " not found, unchanged";
-            boolean original = true;
-            boolean patched = true;
+            boolean isOriginal = true;
+            boolean isPatched = true;
             for (int i = 0; i < expected.length; i++) {
                 byte b = elf.get(at + i);
-                original &= b == expected[i];
-                patched &= b == (i == offset ? value : expected[i]);
+                isOriginal &= b == expected[i];
+                isPatched &= b == patched[i];
             }
-            if (patched) return "already patched";
-            if (!original) return function + " is not the known build, unchanged";
-            elf.put(at + offset, value);
+            if (isPatched) return "already patched";
+            if (!isOriginal) return function + " is not the known build, unchanged";
+            for (int i = 0; i < patched.length; i++) elf.put(at + i, patched[i]);
             elf.force();
             return "patched";
         } finally {
@@ -149,9 +167,9 @@ final class GamePatches {
         return elf.get(at + wanted.length) == 0;
     }
 
-    private static byte[] bytes(int... values) {
-        byte[] out = new byte[values.length];
-        for (int i = 0; i < values.length; i++) out[i] = (byte) values[i];
+    private static byte[] hex(String digits) {
+        byte[] out = new byte[digits.length() / 2];
+        for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(digits.substring(2 * i, 2 * i + 2), 16);
         return out;
     }
 }

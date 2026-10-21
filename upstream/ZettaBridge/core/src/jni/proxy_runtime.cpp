@@ -195,19 +195,21 @@ bool ProxyRuntime::activate_plugin(JniBackend::Env env, const std::string& plugi
         // arm64 proxy directory. The arm32 files it stands for live next to it, so a guest that
         // opens something beside "its own" library finds the real thing (IL2CPP does exactly
         // this and otherwise reports that it cannot load).
-        engine_.add_path_alias(root + "/proxy/", root + "/lib/");
+        engine_.add_path_alias(root + "/proxy/", root + "/lib/", false);
         // Old apps build their private storage path by hand, "/data/data/<package>/...":
         // Minecraft PE keeps games/com.mojang (worlds, options) there. For a plugin that names a
         // directory of another app, which cannot be written and may well exist (the original
         // game installed next to us), so it is the plugin's own data directory instead, which is
-        // exactly what that path means for an installed app.
+        // exactly what that path means for an installed app. These directories exist only in the
+        // guest's view, so a path the guest hands to Java under them is rewritten as well: the
+        // game reads files back through Java (its custom skin, custom.png, by FileInputStream).
         const std::string package = root.substr(root.find_last_of('/') + 1);
         if (!package.empty()) {
-            engine_.add_path_alias("/data/data/" + package, root + "/data");
+            engine_.add_path_alias("/data/data/" + package, root + "/data", true);
             // The pre-N native library directory, which the longest-prefix rule keeps apart.
-            engine_.add_path_alias("/data/data/" + package + "/lib", root + "/lib");
+            engine_.add_path_alias("/data/data/" + package + "/lib", root + "/lib", true);
             engine_.add_path_alias("/data/user/" + std::to_string(::getuid() / 100000) + "/" + package,
-                                   root + "/data");
+                                   root + "/data", true);
         }
         target_sdk_ = target_sdk;
         options_ = std::move(options);
@@ -592,8 +594,8 @@ bool GuestJniEngine::create_native_activity(JniBackend::Env env, std::uint64_t a
     return true;
 }
 
-void GuestJniEngine::add_path_alias(const std::string& guest_prefix, const std::string& host_prefix) {
-    if (runtime_ != nullptr) runtime_->add_path_alias(guest_prefix, host_prefix);
+void GuestJniEngine::add_path_alias(const std::string& guest_prefix, const std::string& host_prefix, bool java) {
+    if (runtime_ != nullptr) runtime_->add_path_alias(guest_prefix, host_prefix, java);
 }
 
 JniLoadReport GuestJniEngine::load(JniBackend::Env env, const std::string& guest_library) {

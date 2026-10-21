@@ -503,8 +503,12 @@ std::vector<std::string> LibraryRuntime::mapped_file_paths() const {
     return impl_->process.mapped_file_paths();
 }
 
-void LibraryRuntime::add_path_alias(std::string guest_prefix, std::string host_prefix) {
-    impl_->process.add_path_alias(std::move(guest_prefix), std::move(host_prefix));
+void LibraryRuntime::add_path_alias(std::string guest_prefix, std::string host_prefix, bool java) {
+    impl_->process.add_path_alias(std::move(guest_prefix), std::move(host_prefix), java);
+}
+
+std::string LibraryRuntime::java_path(std::string_view guest_path) const {
+    return impl_->process.java_path(guest_path);
 }
 
 const zb_service_api& LibraryRuntime::service_api() const {

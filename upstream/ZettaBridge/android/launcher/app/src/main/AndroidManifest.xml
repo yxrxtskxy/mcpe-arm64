@@ -111,6 +111,14 @@
             android:authorities="${applicationId}.pickedimage"
             android:exported="false"
             android:process=":guest" />
+        <!-- Answers a plugin's storage permission request through "All files access". Used only
+             when this manifest also declares MANAGE_EXTERNAL_STORAGE (GuestRuntime.route). -->
+        <activity
+            android:name=".StorageAccessActivity"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|density|screenSize|smallestScreenSize|layoutDirection|colorMode"
+            android:exported="false"
+            android:process=":guest"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <!-- AndroidIDE injects the Kotlin-based LogWire logger into debug builds. This app has no
              Kotlin stdlib, so its init provider crashes the main process. Drop it. -->
         <provider

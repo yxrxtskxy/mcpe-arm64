@@ -129,7 +129,9 @@ bool HostJni::Impl::serve_data(JniCall& call) {
     case ZB_JNI_HC_NewStringUTF: {
         const JniBackend::Env env = call.env();
         if (call.arg(0) == 0) return true;  // ART returns null for a null string
-        const std::string utf = read_string(env, call.arg(0), name);
+        // A path under a directory only the guest sees reaches Java as the real one, since Java
+        // may open it (Process::java_path).
+        const std::string utf = runtime.java_path(read_string(env, call.arg(0), name));
         call.set(local(state, backend.new_string_utf(env, utf.c_str())));
         return true;
     }

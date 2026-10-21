@@ -130,12 +130,14 @@ final class GuestRuntime {
     }
 
     /**
-     * Rewrites an intent that names a plugin activity to the matching stub, and an image pick to
-     * ImagePickActivity; others pass through.
+     * Rewrites an intent that names a plugin activity to the matching stub, an image pick to
+     * ImagePickActivity and a storage permission request to StorageAccessActivity; others pass
+     * through.
      */
     Intent route(Intent intent) {
         if (intent == null) return null;
         if (ImagePickActivity.handles(intent)) return ImagePickActivity.intent(host);
+        if (StorageAccessActivity.handles(host, intent)) return StorageAccessActivity.intent(host, intent);
         if (intent.getComponent() == null) return intent;
         if (host.getPackageName().equals(intent.getComponent().getPackageName())
                 && intent.getComponent().getClassName().startsWith(Stubs.class.getName())) {

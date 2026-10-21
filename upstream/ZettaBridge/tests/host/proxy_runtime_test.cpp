@@ -92,9 +92,9 @@ public:
         return true;
     }
 
-    void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix) override {
+    void add_path_alias(const std::string& guest_prefix, const std::string& host_prefix, bool java) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        aliases.emplace_back(guest_prefix, host_prefix);
+        aliases.push_back({guest_prefix, host_prefix, java});
     }
 
     zb::JniLoadReport load(JniBackend::Env env, const std::string& guest_library) override {
@@ -143,7 +143,12 @@ public:
     std::string start_error;
     std::chrono::milliseconds start_delay{0};
     std::vector<std::string> loads;
-    std::vector<std::pair<std::string, std::string>> aliases;
+    struct Alias {
+        std::string guest_prefix;
+        std::string host_prefix;
+        bool java;
+    };
+    std::vector<Alias> aliases;
     std::map<std::string, zb::JniLoadReport> reports;
     std::map<std::string, int> gated;
 
@@ -231,10 +236,24 @@ void test_bad_runtime_layout(const fs::path& base) {
     CHECK(runtime.activate_plugin(kEnv, tree.root("com.example.a").string(), 16, kLoader, error));
     CHECK(engine.binds == 1 && engine.bound_loader == kLoader);
     // Activation redirects the plugin's arm64 proxy directory at its arm32 libraries, so a guest
-    // that opens a file beside "its own" library reaches the real one.
-    CHECK(engine.aliases.size() == 1);
-    CHECK(engine.aliases[0].first == tree.root("com.example.a").string() + "/proxy/");
-    CHECK(engine.aliases[0].second == tree.root("com.example.a").string() + "/lib/");
+    // that opens a file beside "its own" library reaches the real one. Java keeps seeing the
+    // proxy directory, which exists for it.
+    const std::string root = tree.root("com.example.a").string();
+    CHECK(engine.aliases.size() == 4);
+    CHECK(engine.aliases[0].guest_prefix == root + "/proxy/");
+    CHECK(engine.aliases[0].host_prefix == root + "/lib/");
+    CHECK(!engine.aliases[0].java);
+    // "/data/data/<package>" (and its /data/user form) is the plugin's own data directory, with
+    // the pre-N library directory kept apart. Only the guest sees these, so paths it hands to
+    // Java under them are rewritten as well.
+    CHECK(engine.aliases[1].guest_prefix == "/data/data/com.example.a");
+    CHECK(engine.aliases[1].host_prefix == root + "/data");
+    CHECK(engine.aliases[2].guest_prefix == "/data/data/com.example.a/lib");
+    CHECK(engine.aliases[2].host_prefix == root + "/lib");
+    CHECK(engine.aliases[3].guest_prefix ==
+          "/data/user/" + std::to_string(::getuid() / 100000) + "/com.example.a");
+    CHECK(engine.aliases[3].host_prefix == root + "/data");
+    CHECK(engine.aliases[1].java && engine.aliases[2].java && engine.aliases[3].java);
 }
 
 void test_activation_and_loads(const Tree& tree) {

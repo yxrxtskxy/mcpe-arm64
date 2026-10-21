@@ -245,16 +245,38 @@ bool Process::overlaps_textrel_range(std::uint32_t start, std::uint64_t length) 
     return false;
 }
 
-void Process::add_path_alias(std::string guest_prefix, std::string host_prefix) {
+void Process::add_path_alias(std::string guest_prefix, std::string host_prefix, bool java) {
     if (guest_prefix.empty() || host_prefix.empty()) return;
     std::lock_guard<std::mutex> lock(path_aliases_mutex_);
-    for (auto& [from, to] : path_aliases_) {
-        if (from == guest_prefix) {
-            to = std::move(host_prefix);
+    for (auto& alias : path_aliases_) {
+        if (alias.guest_prefix == guest_prefix) {
+            alias.host_prefix = std::move(host_prefix);
+            alias.java = java;
             return;
         }
     }
-    path_aliases_.emplace_back(std::move(guest_prefix), std::move(host_prefix));
+    path_aliases_.push_back({std::move(guest_prefix), std::move(host_prefix), java});
+}
+
+const Process::PathAlias* Process::match_alias(std::string_view path) const {
+    const PathAlias* best = nullptr;
+    for (const auto& alias : path_aliases_) {
+        const std::string& from = alias.guest_prefix;
+        if (path.substr(0, from.size()) != from) continue;
+        // A prefix without a trailing slash names a directory: it matches that directory and
+        // what is under it, never a sibling that merely starts with the same characters.
+        if (from.back() != '/' && path.size() > from.size() && path[from.size()] != '/') continue;
+        if (best == nullptr || from.size() > best->guest_prefix.size()) best = &alias;
+    }
+    return best;
+}
+
+std::string Process::java_path(std::string_view guest_path) const {
+    if (guest_path.empty() || guest_path[0] != '/') return std::string(guest_path);
+    std::lock_guard<std::mutex> lock(path_aliases_mutex_);
+    const PathAlias* alias = match_alias(guest_path);
+    if (alias == nullptr || !alias->java) return std::string(guest_path);
+    return alias->host_prefix + std::string(guest_path.substr(alias->guest_prefix.size()));
 }
 
 std::string Process::translate_path(const char* guest_path) const {
@@ -262,19 +284,9 @@ std::string Process::translate_path(const char* guest_path) const {
     if (path == "/proc/self/exe") return exe_path_;
     {
         std::lock_guard<std::mutex> lock(path_aliases_mutex_);
-        const std::string* best_from = nullptr;
-        const std::string* best_to = nullptr;
-        for (const auto& [from, to] : path_aliases_) {
-            if (path.substr(0, from.size()) != from) continue;
-            // A prefix without a trailing slash names a directory: it matches that directory and
-            // what is under it, never a sibling that merely starts with the same characters.
-            if (from.back() != '/' && path.size() > from.size() && path[from.size()] != '/') continue;
-            if (best_from == nullptr || from.size() > best_from->size()) {
-                best_from = &from;
-                best_to = &to;
-            }
+        if (const PathAlias* alias = match_alias(path)) {
+            return alias->host_prefix + std::string(path.substr(alias->guest_prefix.size()));
         }
-        if (best_from != nullptr) return *best_to + std::string(path.substr(best_from->size()));
     }
     if (!sysroot_.empty()) {
         for (const auto& m : kPathMappings) {
