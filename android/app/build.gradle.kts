@@ -42,7 +42,6 @@ android {
     buildToolsVersion = "35.0.0"
 
     defaultConfig {
-        // Keep in sync with android:targetPackage in res/xml/shortcuts.xml.
         applicationId = "com.yxrxtskxy.mcpe.arm64"
         minSdk = 26
         targetSdk = 35

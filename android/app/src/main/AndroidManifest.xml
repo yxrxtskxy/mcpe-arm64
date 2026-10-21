@@ -45,11 +45,12 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
         </activity>
 
-        <!-- The launcher's library screen, kept as "Runtime tools" (long-press the app icon): run
-             report, precise faults, GL diagnostics. Not a launcher entry of its own. -->
+        <!-- The launcher's library screen, kept as "Runtime tools": run report, precise faults, GL
+             diagnostics. No launcher entry or app shortcut: it opens from the "could not be
+             started" screen, or `adb shell am start -n <package>/com.zettabridge.launcher.LibraryActivity`,
+             which needs it exported. -->
         <activity
             android:name=".LibraryActivity"
             android:exported="true"

@@ -216,8 +216,10 @@ sh tools/wsl_build_host_x64.sh && sh tests/run_mcpe_dlopen.sh
   Xbyak "code is too big" and symlink loops. The other 32 pass, including the new inline host
   call test and the updated runtime report test.
 
-Troubleshooting on the phone: long-press the app icon → **Runtime tools** → the game → *Last run
-report*. Then `adb logcat -s zbridge zb-launcher mcpe-arm64 MinecraftPE`. With a debug build
+Troubleshooting on the phone: **Runtime tools** → the game → *Last run report*. Runtime tools has
+no icon or shortcut. It opens from the "could not be started" screen, or with
+`adb shell am start -n com.yxrxtskxy.mcpe.arm64/com.zettabridge.launcher.LibraryActivity`. Then
+`adb logcat -s zbridge zb-launcher mcpe-arm64 MinecraftPE`. With a debug build
 (`BUILD_TYPE=debug sh tools/build_apk.sh`), `adb shell run-as com.yxrxtskxy.mcpe.arm64 cat
 files/zb-runtime-report.txt` reads the report directly.
 
