@@ -42,6 +42,9 @@ To update, install the new APK over the old one. Your worlds are kept.
   set *File Storage Location* to *External* in the game's settings. Then allow "All files access"
   when Android asks.
 - **Custom skins:** *Choose New Skin* opens the file picker. Pick a 64×32 or 64×64 PNG.
+- **Short freezes?** Run `adb shell setprop debug.zb.hitch 50` and restart the game. Play until it
+  freezes, then run `adb logcat -d -s zbridge`. Each frame of 50 ms or more gets a `hitch:` line
+  that says where the time went. The setting lasts until the phone restarts.
 - **Problems?** Get the log with `adb logcat -s zbridge zb-launcher mcpe-arm64 MinecraftPE`.
   The *Runtime tools* screen has a report of the last run:
   `adb shell am start -n com.yxrxtskxy.mcpe.arm64/com.zettabridge.launcher.LibraryActivity`.

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <optional>
 
@@ -44,6 +45,16 @@ public:
     void ClearCache();
 
     void DumpDisassembly() const;
+
+    // Diagnostics: written by the thread that runs this address space, readable from any thread.
+    struct TranslationCounters {
+        std::atomic<u64> blocks{0};
+        std::atomic<u64> nanoseconds{0};
+        std::atomic<u64> cache_flushes{0};
+        std::atomic<size_t> code_used{0};
+    };
+    const TranslationCounters& GetTranslationCounters() const { return translation_counters; }
+    size_t GetCodeCacheSize() const { return code_cache_size; }
 
 protected:
     virtual EmitConfig GetEmitConfig() = 0;
@@ -90,6 +101,7 @@ protected:
     const size_t code_cache_size;
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
+    TranslationCounters translation_counters;
 
     // A IR::LocationDescriptor will have one current CodePtr.
     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.

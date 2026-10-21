@@ -4,6 +4,8 @@
 #include <array>
 #include <cstring>
 
+#include "zb/hitch_trace.h"
+
 namespace zb {
 
 namespace {
@@ -99,6 +101,7 @@ bool HostJni::Impl::serve_values(JniCall& call) {
         if (!matches) {
             fatal(env, "CallMethodA: result type %c does not match the method shorty %s", type, shorty->c_str());
         }
+        if (hitch_trace_enabled()) hitch_note_detail(method_name(method).c_str());
         const JniBackend::Ref obj = ref(2);
         const JniBackend::Ref cls = ref(3);
         const std::size_t count = shorty->size() - 1;

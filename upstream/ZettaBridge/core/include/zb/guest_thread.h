@@ -106,6 +106,8 @@ public:
                                     const GuestStopHandler& handle_stop);
     // Drop translated code for [addr, addr + len). Safe to call from other host threads.
     void invalidate(std::uint32_t addr, std::uint32_t len);
+    // What this thread's JIT has translated so far (hitch_trace.h). Safe from any thread.
+    Dynarmic::A32::Jit::TranslationStats translation_stats() const { return jit_->GetTranslationStats(); }
     // See InlineHostCalls. Set before the thread first runs; null stops for every svc.
     void set_inline_host_calls(InlineHostCalls* calls) { inline_calls_ = calls; }
     // True inside a host call served from CallSVC, i.e. with Dynarmic running.
@@ -161,6 +163,10 @@ public:
     int call_depth = 0;
     // Code cache size for threads this thread clones; 0 selects kDefaultCodeCacheSize.
     std::size_t child_code_cache_size = 0;
+    // Nice value the threads this thread clones start with; unset, they inherit its own. Set when
+    // this thread runs above the priority the guest gave it (the render thread, egl_manual.cpp),
+    // so the workers it starts do not inherit that.
+    std::optional<int> spawn_nice;
     // See InlineHostCalls::serve.
     bool host_call_served = false;
     // Host tid of the host thread running this guest thread.

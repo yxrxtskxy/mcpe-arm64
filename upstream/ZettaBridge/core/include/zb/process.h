@@ -24,6 +24,10 @@ class ExclusiveMonitor;
 
 namespace zb {
 
+// {"libGLESv2.so", "glDrawElements"} for a host call of the generated stub libraries; {"?", "?"}
+// for any other index (the JNI ones have jni_host_call_name).
+std::pair<const char*, const char*> host_call_name(std::uint32_t index);
+
 // One guest process: its address space, emulated kernel state and threads.
 class Process : private InlineHostCalls {
 public:
@@ -184,6 +188,9 @@ public:
     // The sampling profiler's tick: asks every guest thread that is running guest code (not
     // blocked in a syscall) for a sample.
     static void request_profile_samples();
+    // Time every live guest thread, borrowers included, has spent translating so far (the freeze
+    // tracer, hitch_trace.h); 0 before the process runs.
+    static std::uint64_t translation_ns_all_threads();
     // svc #0x50|rB from a rewritten spinlock (elf_fixups.h): waits until the lock byte is free.
     void spin_wait(GuestThread& thread, std::uint32_t lock_address);
 

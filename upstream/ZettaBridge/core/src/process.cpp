@@ -4,6 +4,7 @@
 #include <sched.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -29,6 +30,7 @@
 #include "zb/elf_fixups.h"
 #include "zb/elf_loader.h"
 #include "zb/hang_watchdog.h"
+#include "zb/hitch_trace.h"
 #include "zb/initial_stack.h"
 #include "zb/log.h"
 #include "zb/host_egl.h"
@@ -82,13 +84,6 @@ struct HostCallName {
 constexpr HostCallName kHostCallNames[] = {
 #include "gen/hostcalls.inc"
 };
-
-std::pair<const char*, const char*> host_call_name(std::uint32_t index) {
-    for (const auto& host_call : kHostCallNames) {
-        if (host_call.index == index) return {host_call.library, host_call.name};
-    }
-    return {"?", "?"};
-}
 
 struct PathMapping {
     std::string_view guest_prefix;
@@ -173,7 +168,18 @@ bool map_kuser_page(GuestMemory& mem) {
 
 }  // namespace
 
-Process::Process() : monitor_(std::make_unique<Dynarmic::ExclusiveMonitor>(kMaxThreads)) {
+std::pair<const char*, const char*> host_call_name(std::uint32_t index) {
+    for (const auto& host_call : kHostCallNames) {
+        if (host_call.index == index) return {host_call.library, host_call.name};
+    }
+    return {"?", "?"};
+}
+
+// The exclusive monitor is value-checked: GuestThread's exclusive stores compare-and-swap against
+// what the exclusive load read. With the global lock, every LDREX and STREX of every thread (each
+// shared_ptr copy, mutex and allocation of the game) waited on one spin lock, and a holder the
+// kernel preempted kept the others spinning on their CPUs.
+Process::Process() : monitor_(std::make_unique<Dynarmic::ExclusiveMonitor>(kMaxThreads, true)) {
     if (const char* precise = std::getenv("ZB_PRECISE_FAULTS")) precise_faults_ = precise[0] == '1';
 }
 
@@ -578,6 +584,7 @@ bool Process::dispatch_stop(GuestThread& thread, const Stop& stop) {
 }
 
 Process::HostCallOutcome Process::serve_host_call(GuestThread& thread, std::uint32_t index) {
+    const HitchScope hitch(HitchWait::HostCall, index);
     record_thread_activity(thread.tid, ThreadActivityKind::kHostCall, index, thread.regs()[14], thread.regs()[13]);
     // A host call is host C++ called from translated guest code, and an exception that escapes
     // it has no frame above to catch it: the process dies with "terminating" and nothing else.
@@ -651,6 +658,7 @@ bool Process::serve(std::uint32_t swi, GuestThread& thread) {
 // then giving the core away, then short sleeps. It returns as soon as the byte reads 0, after at
 // most about 10 ms, or when a guest signal is pending, and the guest retries its exchange.
 void Process::spin_wait(GuestThread& thread, std::uint32_t lock_address) {
+    const HitchScope hitch(HitchWait::SpinWait, lock_address);
     const std::uint8_t* lock = mem_.host_ptr(lock_address, 1, kPageRead);
     if (lock == nullptr) return;  // the retry faults the guest where the original would have
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
@@ -706,6 +714,16 @@ void Process::request_profile_samples() {
     for (GuestThread* t : process->borrowers_) {
         if (!t->blocking()) t->request_profile_sample();
     }
+}
+
+std::uint64_t Process::translation_ns_all_threads() {
+    Process* process = reporter_process;
+    if (process == nullptr) return 0;
+    std::uint64_t total = 0;
+    std::lock_guard<std::mutex> lock(process->threads_mutex_);
+    for (const GuestThread* t : process->threads_) total += t->translation_stats().nanoseconds;
+    for (const GuestThread* t : process->borrowers_) total += t->translation_stats().nanoseconds;
+    return total;
 }
 
 std::string Process::describe_guest_stack(std::uint32_t sp, unsigned max_entries) {
@@ -811,9 +829,11 @@ std::int32_t Process::clone_thread(GuestThread& parent, std::uint32_t flags, std
     std::promise<pid_t> tid_promise;
     std::future<pid_t> tid_future = tid_promise.get_future();
     register_thread(child.get());
-    std::thread([this, owned = std::move(child), promise = &tid_promise, flags, child_tid_addr]() mutable {
+    std::thread([this, owned = std::move(child), promise = &tid_promise, flags, child_tid_addr,
+                 nice = parent.spawn_nice]() mutable {
         const auto tid = static_cast<pid_t>(::syscall(SYS_gettid));
         owned->tid = tid;
+        if (nice) ::setpriority(PRIO_PROCESS, static_cast<id_t>(tid), *nice);
         if (flags & kCloneChildSetTid) write_guest_u32(mem_, child_tid_addr, static_cast<std::uint32_t>(tid));
         promise->set_value(tid);
         thread_main(std::move(owned));

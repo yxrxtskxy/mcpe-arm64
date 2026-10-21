@@ -46,10 +46,11 @@ void store(std::uint8_t* p, T v) {
     std::memcpy(p, &v, sizeof v);
 }
 
-// STREX: the monitor lock orders exclusive stores against each other only. A plain store from
-// another thread (the release of a spinlock, say) can land between a separate compare and write,
-// and the write then overwrites it: a byte lock taken that way stays set with no owner and every
-// thread spins on it forever. The compare and the write are one atomic exchange on guest memory.
+// STREX: a plain store from another thread (the release of a spinlock, say) can land between a
+// separate compare and write, and the write then overwrites it: a byte lock taken that way stays
+// set with no owner and every thread spins on it forever. The compare and the write are one atomic
+// exchange on guest memory, which is also all that orders exclusive stores against each other:
+// the process's exclusive monitor is value-checked and takes no lock (process.cpp).
 // ARM faults an unaligned exclusive access before it gets here; such an address keeps the plain
 // compare-and-write.
 template <typename T>
@@ -169,7 +170,7 @@ Stop GuestThread::run() {
         jit_->ClearHalt(kStopHalt | kMemoryAbortHalt);
         if (Dynarmic::Has(reason, kProfileHalt)) {
             jit_->ClearHalt(kProfileHalt);
-            record_profile_sample(jit_->Regs()[15]);
+            record_profile_sample(tid, jit_->Regs()[15]);
             if (pending_.kind == StopKind::None && reason == kProfileHalt) continue;
         }
         if (pending_.kind == StopKind::None && Dynarmic::Has(reason, kInterruptHalt)) {

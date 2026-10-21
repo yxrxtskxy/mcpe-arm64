@@ -122,6 +122,17 @@ struct Jit::Impl final {
         current_state.exclusive_state = false;
     }
 
+    Jit::TranslationStats GetTranslationStats() const {
+        const auto& counters = current_address_space.GetTranslationCounters();
+        return {
+            .blocks = counters.blocks.load(std::memory_order_relaxed),
+            .nanoseconds = counters.nanoseconds.load(std::memory_order_relaxed),
+            .cache_flushes = counters.cache_flushes.load(std::memory_order_relaxed),
+            .code_used = counters.code_used.load(std::memory_order_relaxed),
+            .code_size = current_address_space.GetCodeCacheSize(),
+        };
+    }
+
     void DumpDisassembly() const {
         ASSERT_FALSE("Unimplemented");
     }
@@ -230,6 +241,10 @@ void Jit::SetFpscr(std::uint32_t value) {
 
 void Jit::ClearExclusiveState() {
     impl->ClearExclusiveState();
+}
+
+Jit::TranslationStats Jit::GetTranslationStats() const {
+    return impl->GetTranslationStats();
 }
 
 void Jit::DumpDisassembly() const {

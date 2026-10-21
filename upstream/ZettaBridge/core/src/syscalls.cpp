@@ -52,6 +52,7 @@
 #include "zb/guest_memory.h"
 #include "zb/guest_thread.h"
 #include "zb/hang_watchdog.h"
+#include "zb/hitch_trace.h"
 #include "zb/log.h"
 #include "zb/process.h"
 #include "zb/runtime_report.h"
@@ -1568,6 +1569,7 @@ bool handle_syscall(Process& proc, GuestThread& thread) {
         std::int32_t tid;
         ~ActivityDone() { record_thread_activity_done(tid); }
     } activity_done{guest_tid()};
+    const HitchScope hitch(HitchWait::Syscall, nr);
 
     switch (nr) {
     case NR_exit:

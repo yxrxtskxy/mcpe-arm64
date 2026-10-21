@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -97,8 +98,13 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
         return block_entry;
     }
 
+    const auto start = std::chrono::steady_clock::now();
     IR::Block ir_block = GenerateIR(descriptor);
     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    translation_counters.blocks.fetch_add(1, std::memory_order_relaxed);
+    translation_counters.nanoseconds.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()), std::memory_order_relaxed);
+    translation_counters.code_used.store(static_cast<size_t>(code.offset()), std::memory_order_relaxed);
     return block_info.entry_point;
 }
 
@@ -135,6 +141,8 @@ void AddressSpace::ClearCache() {
     block_infos.clear();
     block_references.clear();
     code.set_offset(prelude_info.end_of_prelude);
+    translation_counters.cache_flushes.fetch_add(1, std::memory_order_relaxed);
+    translation_counters.code_used.store(static_cast<size_t>(code.offset()), std::memory_order_relaxed);
 }
 
 void AddressSpace::DumpDisassembly() const {

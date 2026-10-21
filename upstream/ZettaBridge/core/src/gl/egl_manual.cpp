@@ -1,8 +1,14 @@
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -12,6 +18,8 @@
 
 #include "gl/gl_diagnostics.h"
 #include "zb/egl_hostcalls.h"
+#include "zb/guest_thread.h"
+#include "zb/hitch_trace.h"
 #include "zb/host_egl.h"
 #include "zb/log.h"
 #include "zb/runtime_report.h"
@@ -185,6 +193,44 @@ bool serve_configs(HostEgl& host, HostEgl::Call& call, EGLDisplay dpy,
 bool unsupported(HostEgl::Call& call, const char* what) {
     call.fail(kEglBadParameter, what);
     return true;
+}
+
+// Nice value for the thread that presents frames: debug.zb.render_nice, or -16. 0 leaves it alone.
+int render_thread_nice() {
+    static const int value = [] {
+        const char* text = std::getenv("ZB_RENDER_NICE");
+#ifdef __ANDROID__
+        char property[PROP_VALUE_MAX] = {};
+        if (text == nullptr && __system_property_get("debug.zb.render_nice", property) > 0) text = property;
+#endif
+        return text != nullptr ? static_cast<int>(std::strtol(text, nullptr, 10)) : -16;
+    }();
+    return value;
+}
+
+// The thread that presents frames runs ahead of the game's other threads. They all start at the
+// priority they inherit, and translation makes the game's background work several times heavier:
+// while Minecraft PE built chunks on seven workers and FMOD decoded and mixed sound (at -16 and
+// -19, which it asks for itself), its render thread waited up to a second at a time for one of
+// the six cores an app may use. Its priority is raised on its first eglSwapBuffers. Threads it
+// creates afterwards start at the priority it had before (GuestThread::spawn_nice).
+void raise_render_thread(GuestThread& thread) {
+    thread_local bool done = false;
+    if (done) return;
+    done = true;
+    const int nice = render_thread_nice();
+    if (nice == 0) return;
+    const auto tid = static_cast<id_t>(::syscall(SYS_gettid));
+    errno = 0;
+    const int before = ::getpriority(PRIO_PROCESS, tid);
+    if (errno != 0 || before <= nice) return;
+    if (::setpriority(PRIO_PROCESS, tid, nice) != 0) {
+        log("render thread %d: cannot raise its priority from nice %d to %d: %s", static_cast<int>(tid), before,
+            nice, std::strerror(errno));
+        return;
+    }
+    thread.spawn_nice = before;
+    log("render thread %d raised from nice %d to %d", static_cast<int>(tid), before, nice);
 }
 
 }  // namespace
@@ -441,6 +487,8 @@ bool zbegl_manual_eglSwapBuffers(HostEgl& host, HostEgl::Call& call) {
     if (!call.valid()) return true;
     runtime_report().note_egl_swap();
     if (gl_diagnostics_enabled()) gl_diagnose_swap();
+    raise_render_thread(call.thread());
+    hitch_frame_boundary(call.thread());
     call.set_result(host.backend().eglSwapBuffers(dpy, surface));
     return true;
 }

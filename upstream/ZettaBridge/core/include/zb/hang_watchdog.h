@@ -46,8 +46,8 @@ struct ThreadActivitySample {
 
 // Sampling profiler, on when the system property debug.zb.profile is "1" (or ZB_PROFILE is set):
 // guest threads record the guest pc at which a sample request stopped them, and the sampler logs
-// the hottest translated blocks every few seconds.
-void record_profile_sample(std::uint32_t guest_pc);
+// the busiest threads with their hottest translated blocks every few seconds.
+void record_profile_sample(std::int32_t tid, std::uint32_t guest_pc);
 bool profiling_enabled();
 
 // A snapshot of every guest thread slot touched so far.

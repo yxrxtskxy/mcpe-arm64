@@ -24,7 +24,17 @@ public:
     /// @param processor_count Maximum number of processors using this global
     ///                        exclusive monitor. Each processor must have a
     ///                        unique id.
-    explicit ExclusiveMonitor(size_t processor_count);
+    /// @param value_checked   The exclusive write callbacks compare-and-swap
+    ///                        against the value the exclusive read returned, so
+    ///                        a store fails whenever memory changed since. Each
+    ///                        processor then keeps its reservation without the
+    ///                        global lock, and a store leaves other processors'
+    ///                        reservations alone: their own compare-and-swap
+    ///                        fails instead. Only a change that writes the read
+    ///                        value back goes unnoticed, as with any
+    ///                        compare-and-swap. Not for fastmem_exclusive_access,
+    ///                        whose inline code takes the lock.
+    explicit ExclusiveMonitor(size_t processor_count, bool value_checked = false);
 
     size_t GetProcessorCount() const;
 
@@ -34,6 +44,13 @@ public:
     T ReadAndMark(size_t processor_id, VAddr address, Function op) {
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
+
+        if (value_checked) {
+            exclusive_addresses[processor_id] = masked_address;
+            const T value = op();
+            std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+            return value;
+        }
 
         Lock();
         exclusive_addresses[processor_id] = masked_address;
@@ -50,6 +67,16 @@ public:
     template<typename T, typename Function>
     bool DoExclusiveOperation(size_t processor_id, VAddr address, Function op) {
         static_assert(std::is_trivially_copyable_v<T>);
+        if (value_checked) {
+            if (exclusive_addresses[processor_id] != (address & RESERVATION_GRANULE_MASK)) {
+                return false;
+            }
+            exclusive_addresses[processor_id] = INVALID_EXCLUSIVE_ADDRESS;
+            T saved_value;
+            std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
+            return op(saved_value);
+        }
+
         if (!CheckAndClear(processor_id, address)) {
             return false;
         }
@@ -81,6 +108,7 @@ private:
     static constexpr VAddr RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFFFull;
     static constexpr VAddr INVALID_EXCLUSIVE_ADDRESS = 0xDEAD'DEAD'DEAD'DEADull;
     SpinLock lock;
+    const bool value_checked;
     std::vector<VAddr> exclusive_addresses;
     std::vector<Vector> exclusive_values;
 };

@@ -35,7 +35,7 @@ bool HostJni::Impl::serve_objects(JniCall& call) {
         const std::optional<std::string> shorty = shorty_from_signature(signature);
         if (!shorty) fatal(env, "GetMethodID: the backend accepted a malformed signature %s", signature.c_str());
         write_shorty(env, call.arg(4), *shorty, name);
-        call.set(intern_method(id, *shorty));
+        call.set(intern_method(id, *shorty, method));
         return true;
     }
     case ZB_JNI_HC_GetFieldID: {

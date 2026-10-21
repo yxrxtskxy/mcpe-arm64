@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -141,6 +143,16 @@ struct Jit::Impl {
         jit_state.exclusive_state = 0;
     }
 
+    Jit::TranslationStats GetTranslationStats() const {
+        return {
+            .blocks = translated_blocks.load(std::memory_order_relaxed),
+            .nanoseconds = translation_ns.load(std::memory_order_relaxed),
+            .cache_flushes = cache_flushes.load(std::memory_order_relaxed),
+            .code_used = code_used.load(std::memory_order_relaxed),
+            .code_size = block_of_code.GetTotalCodeSize(),
+        };
+    }
+
     std::array<u32, 16>& Regs() {
         return jit_state.Reg;
     }
@@ -213,6 +225,13 @@ private:
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
+        const auto start = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            translated_blocks.fetch_add(1, std::memory_order_relaxed);
+            translation_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()), std::memory_order_relaxed);
+            code_used.store(block_of_code.GetTotalCodeSize() - block_of_code.SpaceRemaining(), std::memory_order_relaxed);
+        };
         IR::Block ir_block = A32::Translate(A32::LocationDescriptor{descriptor}, conf.callbacks, {conf.arch_version, conf.define_unpredictable_behaviour, conf.hook_hint_instructions});
         Optimization::PolyfillPass(ir_block, polyfill_options);
         Optimization::NamingPass(ir_block);
@@ -244,6 +263,7 @@ private:
             if (invalidate_entire_cache) {
                 block_of_code.ClearCache();
                 emitter.ClearCache();
+                cache_flushes.fetch_add(1, std::memory_order_relaxed);
             } else {
                 emitter.InvalidateCacheRanges(invalid_cache_ranges);
             }
@@ -265,6 +285,12 @@ private:
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u32> invalid_cache_ranges;
     std::mutex invalidation_mutex;
+
+    // GetTranslationStats: written by the thread running this Jit, readable from any thread.
+    std::atomic<u64> translated_blocks{0};
+    std::atomic<u64> translation_ns{0};
+    std::atomic<u64> cache_flushes{0};
+    std::atomic<size_t> code_used{0};
 };
 
 Jit::Jit(UserConfig conf)
@@ -334,6 +360,10 @@ void Jit::SetFpscr(std::uint32_t value) {
 
 void Jit::ClearExclusiveState() {
     impl->ClearExclusiveState();
+}
+
+Jit::TranslationStats Jit::GetTranslationStats() const {
+    return impl->GetTranslationStats();
 }
 
 void Jit::DumpDisassembly() const {

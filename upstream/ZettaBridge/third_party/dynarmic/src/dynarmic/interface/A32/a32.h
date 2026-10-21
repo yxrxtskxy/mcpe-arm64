@@ -81,6 +81,21 @@ public:
     /// Clears exclusive state for this core.
     void ClearExclusiveState();
 
+    /// Translation activity since this Jit was created, for diagnostics.
+    struct TranslationStats {
+        std::uint64_t blocks = 0;         ///< Basic blocks translated.
+        std::uint64_t nanoseconds = 0;    ///< Time spent translating and emitting them.
+        std::uint64_t cache_flushes = 0;  ///< Times the whole code cache was dropped.
+        std::size_t code_used = 0;        ///< Bytes of the code cache in use.
+        std::size_t code_size = 0;        ///< Size of the code cache.
+    };
+
+    /**
+     * Returns the translation activity of this Jit.
+     * Can be called from any thread, at any time.
+     */
+    TranslationStats GetTranslationStats() const;
+
     /**
      * Returns true if Jit::Run was called but hasn't returned yet.
      * i.e.: We're in a callback.

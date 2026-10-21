@@ -57,6 +57,7 @@ public:
         Call(HostEgl& host, GuestThread& thread, std::uint32_t index);
 
         std::uint32_t index() const { return index_; }
+        GuestThread& thread() { return thread_; }
         std::uint32_t arg(unsigned position);
         bool valid() const { return valid_; }
 

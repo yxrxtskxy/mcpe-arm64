@@ -11,8 +11,8 @@
 
 namespace Dynarmic {
 
-ExclusiveMonitor::ExclusiveMonitor(size_t processor_count)
-        : exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS), exclusive_values(processor_count) {}
+ExclusiveMonitor::ExclusiveMonitor(size_t processor_count, bool value_checked)
+        : value_checked(value_checked), exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS), exclusive_values(processor_count) {}
 
 size_t ExclusiveMonitor::GetProcessorCount() const {
     return exclusive_addresses.size();

@@ -79,7 +79,8 @@ struct HostJni::Impl {
     IdTable methods;
     IdTable fields;
     std::mutex shorty_mutex;
-    std::vector<std::string> shorties;  // index: guest method id - 1
+    std::vector<std::string> shorties;      // index: guest method id - 1
+    std::vector<std::string> method_names;  // the same; empty when not known
     NativeSlots slots;
     std::atomic<bool> logged_foreign_buffer{false};
 
@@ -113,10 +114,12 @@ struct HostJni::Impl {
     // A host local reference as a handle of the calling thread's top frame.
     std::uint32_t local(JniThread& state, JniBackend::Ref ref) { return state.locals.add(ref); }
 
-    // Guest method ids and their shorties.
-    std::uint32_t intern_method(JniBackend::Id id, const std::string& shorty);
+    // Guest method ids, their shorties and, when the guest looked them up by name, their names.
+    std::uint32_t intern_method(JniBackend::Id id, const std::string& shorty, const std::string& name = {});
     // The shorty of a guest method id; nullopt for an unknown id.
     std::optional<std::string> method_shorty(std::uint32_t id);
+    // The name of a guest method id; empty when it is not known.
+    std::string method_name(std::uint32_t id);
     JniBackend::Id method_id(JniBackend::Env env, std::uint32_t id, const char* function);
     JniBackend::Id field_id(JniBackend::Env env, std::uint32_t id, const char* function);
 
@@ -147,7 +150,6 @@ struct HostJni::Impl {
     bool serve_vm(JniCall& call);
 };
 
-const char* jni_host_call_name(std::uint32_t index);
 // Makes jni the target of the process-wide native thunk dispatcher (host_jni_natives.cpp).
 void install_native_dispatcher(HostJni::Impl* jni);
 

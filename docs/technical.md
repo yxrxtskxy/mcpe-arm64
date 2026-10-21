@@ -116,8 +116,30 @@ In `upstream/ZettaBridge`.
   - Once a second, whichever game thread came next rewrote the report file with an `fsync`.
   - Now the GL counter is lock-free, the thread id is cached, and counter-only updates are
     written by a background thread (`zb-report`).
-- Diagnostics: per-thread activity dumps, `setprop debug.zb.profile 1` (sampled guest PC
-  histogram in logcat every 10 s) and `setprop debug.zb.strace net|all`.
+- **Short freezes while moving** (found with the freeze tracer below; numbers under Status).
+  - *An exclusive monitor without a lock.* Every `LDREX` and `STREX` of every guest thread took
+    Dynarmic's one global spin lock, and every `STREX` scanned all 256 reservations under it. The
+    game does that for each `shared_ptr` copy, mutex and allocation. When the kernel preempted
+    the holder, the other threads spun on their CPUs, so the render thread stayed busy without
+    getting anywhere. ZettaBridge's `STREX` already compare-and-swaps against what `LDREX` read,
+    so the monitor is now value-checked and takes no lock (see Changes to Dynarmic).
+  - *Render thread priority.* Every guest thread inherits the same priority (nice -10), and FMOD
+    raises its own threads to -16 and -19. While seven workers built chunks, the render thread
+    waited up to a second at a time for one of the six cores an app gets. On its first
+    `eglSwapBuffers` it now goes to -16 (`setprop debug.zb.render_nice <n>` overrides it, 0 leaves
+    it alone). Threads it creates afterwards start at its old priority.
+- Diagnostics: per-thread activity dumps, `setprop debug.zb.profile 1` (the busiest guest threads
+  with their hottest blocks in logcat every 10 s) and `setprop debug.zb.strace net|all`.
+- **Freeze tracer**, `setprop debug.zb.hitch <ms>` (`hitch_trace.cpp`), read when the game starts.
+  - Every frame of the render thread (one `eglSwapBuffers` to the next) that takes at least that
+    long gets one `hitch:` line in logcat. It splits the frame into translating new guest code,
+    syscalls, host calls and spinlock waits, each with its longest single wait. A JNI call names
+    its Java method.
+  - What is left is guest code. The line also has the thread's time on and off the CPU, its page
+    faults and context switches.
+  - A `hitch summary:` line follows every 30 s, with how full the render thread's code cache is.
+  - With the profiler on as well, each logged frame names its hottest guest addresses.
+  - Off, it costs one test per syscall and host call.
 - `PluginStore.importApk(Context, InputStream)` for the bundled APK, and a Windows path fix in
   `check_launcher_bundle.py`.
 
@@ -133,6 +155,21 @@ In `upstream/ZettaBridge/third_party/dynarmic`, on top of ZettaBridge's own two 
   - A miss fills the table from the C++ lookup.
   - Code-cache flushes and block invalidation clear the affected entries.
   - The table is anonymous memory, committed only where entries are written.
+- **Translation statistics.** `A32::Jit::GetTranslationStats()` reports, readable from any thread:
+  - blocks translated and the time spent translating them;
+  - full code-cache flushes;
+  - code cache use.
+
+  Both backends implement it. The freeze tracer reads it.
+- **Value-checked exclusive monitor**, `ExclusiveMonitor(processor_count, value_checked)`.
+  - It is for exclusive write callbacks that compare-and-swap against the value the exclusive read
+    returned, as ZettaBridge's do.
+  - Each processor then keeps its reservation without the global lock. A store leaves the other
+    reservations alone, and their own compare-and-swap fails instead.
+  - The one difference from real hardware: a change that writes the read value back goes
+    unnoticed, as with any compare-and-swap.
+  - The default stays as it was. It cannot be combined with `fastmem_exclusive_access`, whose
+    inline x86_64 code takes the lock.
 
 ## Building (Windows + WSL)
 
@@ -198,6 +235,19 @@ sh tools/wsl_build_host_x64.sh && sh tests/run_mcpe_dlopen.sh
 
     The game is CPU-bound on its render thread. Translated game code is the largest share,
     followed by the GL driver.
+  - Flying through new terrain in a creative world for 40 s, with the freeze tracer on (two runs
+    each):
+
+    | | 1.1.5-arm64.2 | 1.1.5-arm64.3 |
+    |---|---|---|
+    | Frames of 50 ms or more | 59–73 | 3 |
+    | Time spent in them | 10.4–12.8 s | 0.2 s |
+    | Longest frame | 680–868 ms | 74–79 ms |
+    | Frame rate while moving | 52–57 fps | 95–105 fps |
+
+    The lock-free exclusive monitor makes nearly all of the difference. The render thread's
+    priority halves what is left. A 2.5-minute flight afterwards had 3 frames over 100 ms, the
+    longest 134 ms.
 - First launch after each install or update spends a few seconds importing the bundled game; the
   game's data directory (worlds, options) is kept.
 - Untested: Xbox Live sign-in, multiplayer and Realms, the Store, long sessions. ZettaBridge itself is

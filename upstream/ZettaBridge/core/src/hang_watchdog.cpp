@@ -19,6 +19,7 @@
 #include <cstring>
 #include <thread>
 
+#include "zb/hitch_trace.h"
 #include "zb/host_jni.h"
 #include "zb/log.h"
 #include "zb/process.h"
@@ -50,7 +51,7 @@ Slot g_slots[kMaxSlots];
 
 namespace {
 std::mutex g_profile_mutex;
-std::unordered_map<std::uint32_t, std::uint64_t> g_profile;
+std::unordered_map<std::int32_t, std::unordered_map<std::uint32_t, std::uint64_t>> g_profile;  // tid -> pc -> samples
 std::uint64_t g_profile_total = 0;
 }  // namespace
 
@@ -66,30 +67,46 @@ bool profiling_enabled() {
     return enabled;
 }
 
-void record_profile_sample(std::uint32_t guest_pc) {
+void record_profile_sample(std::int32_t tid, std::uint32_t guest_pc) {
+    hitch_note_sample(guest_pc);
     std::lock_guard<std::mutex> lock(g_profile_mutex);
-    ++g_profile[guest_pc];
+    ++g_profile[tid][guest_pc];
     ++g_profile_total;
 }
 
 namespace {
-// Logs the hottest guest blocks since the last report and starts counting afresh.
+// Logs the busiest guest threads since the last report, each with its hottest blocks, and starts
+// counting afresh. Percentages are of all samples, so threads compare with each other.
 void report_profile() {
-    std::vector<std::pair<std::uint32_t, std::uint64_t>> hot;
+    std::unordered_map<std::int32_t, std::unordered_map<std::uint32_t, std::uint64_t>> profile;
     std::uint64_t total;
     {
         std::lock_guard<std::mutex> lock(g_profile_mutex);
-        hot.assign(g_profile.begin(), g_profile.end());
+        profile.swap(g_profile);
         total = g_profile_total;
-        g_profile.clear();
         g_profile_total = 0;
     }
     if (total == 0) return;
-    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::vector<std::pair<std::int32_t, std::uint64_t>> threads;
+    for (const auto& [tid, pcs] : profile) {
+        std::uint64_t samples = 0;
+        for (const auto& entry : pcs) samples += entry.second;
+        threads.emplace_back(tid, samples);
+    }
+    std::sort(threads.begin(), threads.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    const auto percent = [total](std::uint64_t samples) {
+        return 100.0 * static_cast<double>(samples) / static_cast<double>(total);
+    };
     log("profile: %llu samples", static_cast<unsigned long long>(total));
-    for (std::size_t i = 0; i < hot.size() && i < 30; ++i) {
-        log("profile: %5.1f%% 0x%08x %s", 100.0 * static_cast<double>(hot[i].second) / static_cast<double>(total),
-            hot[i].first, Process::describe_guest_address(hot[i].first).c_str());
+    for (std::size_t t = 0; t < threads.size() && t < 8; ++t) {
+        const auto [tid, samples] = threads[t];
+        log("profile: thread %d %5.1f%%", static_cast<int>(tid), percent(samples));
+        std::vector<std::pair<std::uint32_t, std::uint64_t>> hot(profile[tid].begin(), profile[tid].end());
+        std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (std::size_t i = 0; i < hot.size() && i < 10; ++i) {
+            log("profile:   %5.1f%% 0x%08x %s", percent(hot[i].second), hot[i].first,
+                Process::describe_guest_address(hot[i].first).c_str());
+        }
     }
 }
 }  // namespace

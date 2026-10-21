@@ -45,7 +45,7 @@ android {
         applicationId = "com.yxrxtskxy.mcpe.arm64"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
+        versionCode = 3
         versionName = gameInfo.getProperty("versionName")
         ndk { abiFilters += "arm64-v8a" }
     }

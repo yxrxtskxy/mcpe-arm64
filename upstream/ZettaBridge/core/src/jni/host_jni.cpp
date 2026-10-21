@@ -207,12 +207,16 @@ JniBackend::Ref HostJni::Impl::resolve(JniThread& state, std::uint32_t handle, c
     return *ref;
 }
 
-std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string& shorty) {
+std::uint32_t HostJni::Impl::intern_method(JniBackend::Id id, const std::string& shorty, const std::string& name) {
     const std::uint32_t guest = methods.intern(id);
     if (guest == 0) return 0;
     std::lock_guard<std::mutex> lock(shorty_mutex);
-    if (shorties.size() < guest) shorties.resize(guest);
+    if (shorties.size() < guest) {
+        shorties.resize(guest);
+        method_names.resize(guest);
+    }
     shorties[guest - 1] = shorty;
+    if (!name.empty()) method_names[guest - 1] = name;
     return guest;
 }
 
@@ -220,6 +224,12 @@ std::optional<std::string> HostJni::Impl::method_shorty(std::uint32_t id) {
     std::lock_guard<std::mutex> lock(shorty_mutex);
     if (id == 0 || id > shorties.size() || shorties[id - 1].empty()) return std::nullopt;
     return shorties[id - 1];
+}
+
+std::string HostJni::Impl::method_name(std::uint32_t id) {
+    std::lock_guard<std::mutex> lock(shorty_mutex);
+    if (id == 0 || id > method_names.size()) return {};
+    return method_names[id - 1];
 }
 
 JniBackend::Id HostJni::Impl::method_id(JniBackend::Env env, std::uint32_t id, const char* function) {
