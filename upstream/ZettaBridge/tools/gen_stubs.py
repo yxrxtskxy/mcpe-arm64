@@ -189,6 +189,17 @@ def gles1_names():
     return sorted(set(re.findall(r"^GL_API\w*\s+\w[\w \*]*\bGL_APIENTRY\s+(gl\w+)\s*\(", text, re.M)))
 
 
+def gles3_library_names():
+    """Everything the libGLESv2 stub exports, for guests that link libGLESv3.so instead.
+
+    Android's libGLESv3.so exports the same GLES 2.0 and 3.0 functions as libGLESv2.so, and a game
+    that renders through GLES 3 lists only libGLESv3.so as a dependency. One missing library stops
+    the whole guest from loading ("library libGLESv3.so not found"). Every name is already served
+    by libGLESv2, so this library reuses those host calls and adds none.
+    """
+    return gles2_names() + gles2_compat_names() + gles3_names() + gles_ext_names()
+
+
 def looper_pollall_names():
     """ALooper_pollAll, appended late because it turned up in a real guest after the rest.
 
@@ -261,6 +272,8 @@ LIBRARIES = [
     # ANativeActivity_* helpers (finish, soft input, window flags/format), last for the same
     # append-only reason. Minecraft PE imports ANativeActivity_finish.
     ("libandroid", native_activity_names),
+    # GLES 3 under its own name, last. All of its functions share host calls with libGLESv2.
+    ("libGLESv3", gles3_library_names),
 ]
 
 

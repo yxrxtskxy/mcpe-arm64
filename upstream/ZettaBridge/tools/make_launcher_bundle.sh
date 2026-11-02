@@ -26,8 +26,8 @@ system/lib/libz.so
 
 for required in "$ANDROID/libzbridge.so" "$ANDROID/libzbproxy.so" "$GUEST/zbhost" \
         "$GUEST/lib/libzbcompat.so" "$GUEST/lib/libzbjni.so" "$GUEST/lib/libGLESv2.so" \
-        "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libEGL.so" "$GUEST/lib/libandroid.so" \
-        "$GUEST/lib/libjnigraphics.so" "$GUEST/lib/libnetd_client.so"; do
+        "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libGLESv3.so" "$GUEST/lib/libEGL.so" \
+        "$GUEST/lib/libandroid.so" "$GUEST/lib/libjnigraphics.so" "$GUEST/lib/libnetd_client.so"; do
     if [ ! -f "$required" ]; then
         echo "missing $required (build the Android core and guest artifacts first)" >&2
         exit 1
@@ -48,7 +48,8 @@ for relative in $SYSROOT_FILES; do
 done
 cp "$GUEST/zbhost" "$ZB/guest/zbhost"
 cp "$GUEST/lib/libzbcompat.so" "$GUEST/lib/libzbjni.so" \
-    "$GUEST/lib/libGLESv2.so" "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libEGL.so" "$GUEST/lib/libandroid.so" \
+    "$GUEST/lib/libGLESv2.so" "$GUEST/lib/libGLESv1_CM.so" "$GUEST/lib/libGLESv3.so" \
+    "$GUEST/lib/libEGL.so" "$GUEST/lib/libandroid.so" \
     "$GUEST/lib/libjnigraphics.so" "$GUEST/lib/libnetd_client.so" \
     "$ZB/guest/lib/"
 cp "$ANDROID/libzbproxy.so" "$ZB/host/libzbproxy.so"

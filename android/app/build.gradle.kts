@@ -42,7 +42,7 @@ android {
     buildToolsVersion = "35.0.0"
 
     defaultConfig {
-        applicationId = "com.yxrxtskxy.mcpe.arm64"
+        applicationId = "com.yxrxtskxy.breadix.arm64"
         minSdk = 26
         targetSdk = 35
         versionCode = 4

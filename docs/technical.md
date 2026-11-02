@@ -62,6 +62,11 @@ In `upstream/ZettaBridge`.
 - **Dropped `DT_NEEDED libOpenSLES.so`** at import (`elf_fixups.cpp`, `fix_guest_lib.py`). The game
   links OpenSL ES without importing anything from it. FMOD's own runtime probe then fails cleanly,
   and FMOD plays through its Java AudioTrack output instead.
+- **`libGLESv3.so` guest stub.** A library that renders through GLES 3 lists `libGLESv3.so` as a
+  dependency, and without it in the guest the linker refuses to load that library (`library
+  "libGLESv3.so" not found`). The stub exports what the `libGLESv2.so` stub does and shares its
+  host calls, so no host-call number moved (`gen_stubs.py`). Minecraft PE 1.1.5 itself needs only
+  `libEGL.so`; a modified build with an extra GLES 3 library, such as `libbworldclient.so`, needs this.
 - **CP15 generic timer** (CNTVCT/CNTFRQ) and a logged no-op for every other unhandled coprocessor
   access. OpenSSL's CPU probe in the game's static constructors reads CNTVCT, and before this
   change Dynarmic aborted the whole process at JIT time.
